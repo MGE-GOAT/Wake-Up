@@ -1,0 +1,35 @@
+# ── Flutter / Dart build artifacts (regenerable) ─────────────────────────────
+/build/
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+**/*.dill
+.pub-cache/
+.pub/
+
+# ── IDE / machine-specific ───────────────────────────────────────────────────
+*.iml
+.idea/
+.gradle/
+android/local.properties
+android/.gradle/
+.DS_Store
+
+# ── Signing secrets — NEVER commit ───────────────────────────────────────────
+android/key.properties
+*.jks
+*.keystore
+key.jks
+upload-keystore.jks
+
+# ── iOS / macOS pods ─────────────────────────────────────────────────────────
+ios/Pods/
+macos/Pods/
+**/Flutter/ephemeral/
+
+# KEEP (needed): pubspec.lock, vendor/ (patched record_linux),
+# android/app/google-services.json + lib/firebase_options.dart (client keys).
+
+# regenerable Flutter build symlinks
+linux/flutter/ephemeral/

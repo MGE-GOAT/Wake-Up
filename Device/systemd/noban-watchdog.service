@@ -1,0 +1,7 @@
+[Unit]
+Description=Noban self-heal watchdog (reboot once if WUW pipeline never reaches Listening)
+After=elderly-pipeline.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/noban-watchdog.sh

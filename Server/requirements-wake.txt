@@ -1,0 +1,16 @@
+# Extra dependencies for /Wake_Command (STT + LLM intent classifier).
+# Install in the existing `app` conda env:
+#
+#   conda activate app
+#   pip install -r requirements-wake.txt
+#
+# For GPU acceleration, llama-cpp-python must be built with CUDA support.
+# The line below uses the prebuilt wheel for CUDA 12.x. For CUDA 11.8 swap
+# the index URL to cu118.
+
+faster-whisper>=1.0.3
+ctranslate2>=4.5.0
+
+# llama-cpp-python with CUDA prebuilt wheels (matches CUDA toolkit on host)
+--extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu122
+llama-cpp-python>=0.3.2

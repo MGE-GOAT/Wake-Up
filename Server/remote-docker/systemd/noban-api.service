@@ -1,0 +1,14 @@
+[Unit]
+Description=Noban API server (model-free; enqueues wake-jobs to Redis)
+After=network.target redis-server.service postgresql.service
+Wants=redis-server.service postgresql.service
+
+[Service]
+WorkingDirectory=/home/mahrad/storage/Data/Server
+Environment=WORKERS=4
+ExecStart=/usr/bin/env bash /home/mahrad/storage/Data/Server/local-lan/run_async.sh
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

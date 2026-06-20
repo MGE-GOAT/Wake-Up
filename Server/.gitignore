@@ -1,0 +1,28 @@
+# ── Large models (~8 GB) — NOT in git; run ./fetch_models.sh ──────────────────
+models/
+uploads/
+*.gguf
+*.bin
+*.incomplete
+
+# ── Secrets — provide your own (see REQUIRED_FILES.md) ────────────────────────
+elderly-care-assistant-*.json
+elderly-care-assistant.json
+secrets.env
+.env
+*.pem
+*.key
+
+# ── Python / build / junk ────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.log
+*.removed
+*.bak
+*.bak-*
+*.sqlite
+*.sqlite3
+.DS_Store
+.ipynb_checkpoints/

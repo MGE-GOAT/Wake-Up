@@ -1,0 +1,9 @@
+# VideoRoom plugin — the SFU that forwards call media (no transcoding).
+# Rooms are created DYNAMICALLY, one per device (server: room_for(device_id)); the
+# clients issue create/join over the API, so no static rooms are defined here.
+general: {
+	# To lock down room creation, set an admin_key here and have the server create
+	# rooms with it (instead of clients creating them):
+	# admin_key = "CHANGE_ME"
+	# lock_rtp_forwarding = true
+}

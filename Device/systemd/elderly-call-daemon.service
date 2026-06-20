@@ -1,0 +1,22 @@
+[Unit]
+Description=Noban warm call daemon (pre-imported aiortc → fast call start)
+After=elderly-pipeline.service
+
+[Service]
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=AEC_MODE=off
+Environment=AEC_DELAY_MS=200
+Environment=GATE_THRESHOLD=200
+Environment=GATE_HANGOVER=0.8
+User=pi
+Group=pi
+Environment=HOME=/home/pi
+Environment=PYTHONUNBUFFERED=1
+WorkingDirectory=/home/pi/device_bundle/Noban
+Environment=SERVER_URL=http://noban.local:5000
+ExecStart=/usr/bin/python3 /home/pi/device_bundle/Noban/wake_call_helper.py --serve
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

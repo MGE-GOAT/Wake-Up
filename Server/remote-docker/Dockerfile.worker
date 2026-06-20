@@ -1,0 +1,53 @@
+# Noban GPU wake-worker — the ONLY process that loads whisper + the LLM.
+# DEVEL base (has nvcc) so we can BUILD llama-cpp for this CPU's ISA.
+#
+# WHY source-build instead of the prebuilt CUDA wheel: the abetlen prebuilt
+# llama-cpp CUDA wheels are compiled with AVX512, but our target CPU is AVX2-only
+# (verified: 9534 avx512 instrs in the wheel → SIGILL/exit-132 on model load).
+# Building with AVX512 OFF makes it run on AVX2 hardware.
+FROM nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
+
+# Optional apt mirror for restricted networks (e.g. APT_MIRROR=mirror.arvancloud.ir).
+# Default empty → upstream Ubuntu mirrors are left UNTOUCHED so a plain build works
+# anywhere. Only when APT_MIRROR is non-empty do we rewrite archive/security URLs.
+ARG APT_MIRROR=
+
+# Drop the nvidia CUDA apt repo (developer.download.nvidia.com won't resolve here;
+# not needed — the toolkit is in the base image).
+RUN rm -f /etc/apt/sources.list.d/cuda*.list /etc/apt/sources.list.d/nvidia-ml.list 2>/dev/null; \
+    if [ -n "$APT_MIRROR" ]; then \
+        echo "Using apt mirror: $APT_MIRROR"; \
+        sed -i "s|http://archive.ubuntu.com/ubuntu|http://${APT_MIRROR}/ubuntu|g; s|http://security.ubuntu.com/ubuntu|http://${APT_MIRROR}/ubuntu|g" /etc/apt/sources.list; \
+    fi; \
+    for i in 1 2 3 4 5 6; do apt-get update && break; echo "apt-get update retry $i (mirror sync?)"; sleep 20; done; \
+    apt-get install -y --no-install-recommends \
+        python3 python3-pip git build-essential cmake ninja-build \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY requirements-wake.txt .
+
+# Optional pip proxy for restricted networks (PyPI is HTTPS; an HTTPS-capable proxy
+# works here). On a good-net build host, omit --build-arg PIP_PROXY (→ empty → no proxy).
+ARG PIP_PROXY=
+ENV http_proxy=${PIP_PROXY} https_proxy=${PIP_PROXY}
+
+# Build llama-cpp-python from source: CUDA on, AVX2 on, AVX512 OFF (matches our
+# AVX2-only deploy CPU). GGML_NATIVE=OFF so it doesn't auto-enable AVX512 even if
+# the build host has it.
+# GGML_CUDA_NO_VMM=ON: all the unresolved cu* symbols (cuMem*, cuDeviceGet,
+# cuGetErrorString) come from ggml's CUDA VMM memory-pool code, which needs the
+# CUDA *driver* lib (absent at build time). Disabling VMM drops that dependency —
+# regular cudaMalloc pool is used instead (negligible perf cost for 7B on 6 GB).
+# Keep -lcuda + the stub LIBRARY_PATH as a belt-and-suspenders for any stragglers.
+RUN CMAKE_ARGS="-DGGML_CUDA=on -DGGML_CUDA_NO_VMM=ON -DGGML_NATIVE=OFF -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_AVX512=OFF -DGGML_FMA=ON -DGGML_F16C=ON -DCMAKE_SHARED_LINKER_FLAGS=-lcuda" \
+    LIBRARY_PATH=/usr/local/cuda/lib64/stubs \
+        pip3 install --no-cache-dir --no-binary llama-cpp-python llama-cpp-python \
+ && pip3 install --no-cache-dir -r requirements-wake.txt redis
+
+# Clear proxy so it doesn't persist into the runtime container.
+ENV http_proxy= https_proxy=
+
+COPY wake_worker.py wake_command.py ./
+
+CMD ["python3", "wake_worker.py"]

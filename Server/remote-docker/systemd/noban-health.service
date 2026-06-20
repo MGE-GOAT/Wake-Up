@@ -1,0 +1,5 @@
+[Unit]
+Description=Noban server health watchdog (one-shot)
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/env bash /home/mahrad/storage/Data/Server/remote-docker/health_watchdog.sh

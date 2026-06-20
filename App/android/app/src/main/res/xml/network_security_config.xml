@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Cleartext HTTP is blocked app-wide EXCEPT to the Noban LAN server.
+     The previous blanket android:usesCleartextTraffic="true" allowed plain
+     HTTP to any host on the internet. The server runs plain HTTP on the
+     local network (no TLS), so its hosts are explicitly allow-listed here;
+     everything else must be HTTPS. If the server IP changes, update BOTH
+     the build-time SERVER_URL dart-define and this list. -->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false" />
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">192.168.1.38</domain>
+        <domain includeSubdomains="false">192.168.0.163</domain>
+        <domain includeSubdomains="false">192.168.0.154</domain>
+        <!-- mDNS hostname — survives PC IP changes (PC publishes noban.local) -->
+        <domain includeSubdomains="false">noban.local</domain>
+        <domain includeSubdomains="false">192.168.1.104</domain>
+        <domain includeSubdomains="false">192.168.1.102</domain>
+        <domain includeSubdomains="false">10.253.212.246</domain>
+        <!-- adb-reverse / local dev paths -->
+        <domain includeSubdomains="false">127.0.0.1</domain>
+        <domain includeSubdomains="false">localhost</domain>
+        <!-- Android emulator → host-machine alias (for emulator testing) -->
+        <domain includeSubdomains="false">10.0.2.2</domain>
+    </domain-config>
+</network-security-config>

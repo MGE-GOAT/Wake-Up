@@ -1,0 +1,24 @@
+# Models are mounted as a runtime volume (compose), never baked into the image.
+models/
+deploy/models/
+uploads/
+*.wav
+*.mp4
+# Secrets — provided at RUNTIME (compose mounts the key), never baked into the image.
+elderly-care-assistant-*.json
+elderly-care-assistant.json
+secrets.env
+.env
+*.pem
+*.key
+# junk / backups / caches
+__pycache__/
+*.pyc
+*.removed
+*.bak*
+*.sfu-offerer
+.git/
+*.log
+.venv/
+remote-docker/
+local-lan/

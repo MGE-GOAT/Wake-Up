@@ -1,0 +1,30 @@
+# Core server dependencies (run in the `app` conda env).
+#
+#   conda activate app
+#   pip install -r requirements-server.txt
+#
+# /Wake_Command's STT + LLM intent classifier is split out into
+# requirements-wake.txt because it pulls in GPU-specific llama wheels.
+# (faster_whisper / llama_cpp are imported lazily by the worker only — NOT here.)
+
+# ── ASGI web stack (app_async.py is FastAPI/uvicorn) ──────────────────────────
+fastapi>=0.110              # app_async.py: FastAPI app + routing
+uvicorn[standard]>=0.29     # ASGI server (run_*.sh + Dockerfile.api launch uvicorn)
+python-multipart>=0.0.9     # FastAPI UploadFile / Form() multipart parsing
+
+# ── Data layer ────────────────────────────────────────────────────────────────
+asyncpg>=0.29               # async PostgreSQL driver
+redis>=5.0                  # redis.asyncio queue client
+
+# ── Auth / crypto ─────────────────────────────────────────────────────────────
+bcrypt>=4.1                 # password hashing
+pynacl>=1.5                 # XChaCha20-Poly1305 + HKDF helpers in media_crypto.py
+
+# ── FCM push (Firebase) ───────────────────────────────────────────────────────
+requests>=2.31             # FCM HTTP calls + token refresh
+google-auth>=2.29          # service_account creds + google.auth.transport.requests
+
+# ── Messaging / SMTP / calls ──────────────────────────────────────────────────
+PySocks>=1.7.1             # SMTP via xray SOCKS5 (Iran network)
+paho-mqtt>=2.1             # Phase 5.1 MQTT publisher (mqtt_pub.py)
+aiortc>=1.9               # WebRTC for wake_call_helper.py video calls

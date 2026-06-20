@@ -1,0 +1,35 @@
+# ── Secrets (never commit) ───────────────────────────────
+secrets.env
+*.env
+!*.env.example
+elderly-care-assistant*.json      # Firebase admin service-account key
+*.pem
+*.key
+id_rsa*
+*.keystore
+*.jks
+
+# ── Large models (fetched separately, not in git) ────────
+Server/models/
+*.gguf
+faster-whisper-*/
+# NOTE: the small on-device TFLite models under Device/Noban/models/ ARE tracked.
+
+# ── Build / cache artifacts ──────────────────────────────
+**/__pycache__/
+*.pyc
+**/build/
+**/.dart_tool/
+**/.gradle/
+*.apk
+*.aab
+node_modules/
+
+# ── Device model backups ─────────────────────────────────
+*.bak-*
+
+# ── OS / editor ──────────────────────────────────────────
+.DS_Store
+*.swp
+.idea/
+.vscode/

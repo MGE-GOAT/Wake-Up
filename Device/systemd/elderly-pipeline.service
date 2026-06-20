@@ -1,0 +1,27 @@
+[Unit]
+Description=Elderly-care device pipeline (WUW + fall + pain)
+After=elderly-camera.service
+Wants=elderly-camera.service
+# Disable start rate-limiting: at boot the i2s mic / camera feeder may not be
+# ready the instant we start, so the pipeline can exit + restart a few times
+# before hardware settles. Without this it hits the default 5-in-10s limit
+# and systemd gives up ("inactive dead").
+StartLimitIntervalSec=0
+
+[Service]
+Environment=LD_LIBRARY_PATH=/home/pi/device_bundle/Noban/deps/onnxruntime/lib
+TimeoutStopSec=15
+KillMode=mixed
+User=pi
+WorkingDirectory=/home/pi/device_bundle/Noban
+Environment=MQTT_HOST=noban.local
+Environment=SERVER_URL=http://noban.local:5000
+Environment=CAMERA_DEV=/dev/video9
+# Let the i2s sound card + camera feeder settle before first launch.
+ExecStartPre=/bin/sleep 8
+ExecStart=/home/pi/device_bundle/Noban/build/pipeline
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

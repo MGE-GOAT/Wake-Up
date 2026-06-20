@@ -1,0 +1,24 @@
+# ── Build output + vendored native deps (regenerable; rebuilt by setup) ───────
+Noban/build/
+Noban/deps/
+Noban/failures/
+Noban/samples/
+
+# ── Junk / caches ────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.bak
+*.bak-*
+*.lgd-nfy0
+.DS_Store
+
+# ── Device-local secret (provisioned per-unit, never commit) ──────────────────
+# id.txt holds the device id + 32-char shared password (lives in /var/lib/elderly-care)
+id.txt
+
+# KEEP (needed): Noban/*.onnx, Noban/*.tflite, Noban/models/, libaecwrap.so,
+# all source, system-config/ (real /etc files), systemd/, setup_new_device.sh.
+
+# raw model staging (provenance only)
+new_models/
+*.predoublegate

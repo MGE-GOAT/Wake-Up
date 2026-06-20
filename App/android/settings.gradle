@@ -1,0 +1,49 @@
+pluginManagement {
+    def flutterSdkPath = {
+        def properties = new Properties()
+        file("local.properties").withInputStream { properties.load(it) }
+        def flutterSdkPath = properties.getProperty("flutter.sdk")
+        assert flutterSdkPath != null, "flutter.sdk not set in local.properties"
+        return flutterSdkPath
+    }()
+
+    includeBuild("$flutterSdkPath/packages/flutter_tools/gradle")
+
+    repositories {
+        // Myket Maven mirror (Iran) — primary source for AGP / plugin artifacts.
+        maven { url "https://mvn.myket.ir" }
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+    }
+
+    // google-services doesn't publish a plugin marker at any public repo — only
+    // the real artifact com.google.gms:google-services. Map id → module so the
+    // plugin DSL block can resolve it via google()'s dl.google.com mirror.
+    resolutionStrategy {
+        eachPlugin {
+            // Several plugins we use don't publish a plugin-marker artifact at
+            // any public repo from this network, but their real artifacts are
+            // already cached locally / reachable via dl.google.com.
+            // Map id → real module so the plugins{} block can resolve them.
+            if (requested.id.id == 'com.google.gms.google-services') {
+                useModule("com.google.gms:google-services:${requested.version}")
+            }
+            if (requested.id.id == 'com.android.application') {
+                useModule("com.android.tools.build:gradle:${requested.version}")
+            }
+        }
+    }
+}
+
+plugins {
+    id "dev.flutter.flutter-plugin-loader" version "1.0.0"
+    // id "com.android.application" version "8.1.0" apply false
+    // START: FlutterFire Configuration
+    id "com.google.gms.google-services" version "4.3.15" apply false
+    // END: FlutterFire Configuration
+    id "com.android.application" version "8.2.1" apply false
+    id "org.jetbrains.kotlin.android" version "2.1.0" apply false
+}
+
+include ":app"

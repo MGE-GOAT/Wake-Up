@@ -1,0 +1,23 @@
+allprojects {
+    repositories {
+        // Myket Maven mirror (Iran) — reliable access to google()/mavenCentral()
+        // artifacts from this network; listed first so Gradle prefers it.
+        maven { url "https://mvn.myket.ir" }
+        google()
+        mavenCentral()
+    }
+}
+
+
+rootProject.buildDir = "../build"
+subprojects {
+    project.buildDir = "${rootProject.buildDir}/${project.name}"
+}
+subprojects {
+    project.evaluationDependsOn(":app")
+}
+
+tasks.register("clean", Delete) {
+    delete rootProject.buildDir
+}
+

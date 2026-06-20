@@ -1,0 +1,105 @@
+# Noban single-box deployment — one server, one GPU.
+#   API workers (CPU) → Redis queue → ONE GPU worker (whisper+LLM)
+#   Janus SFU + coturn for calls. Postgres + Redis + mosquitto for state.
+# `restart: unless-stopped` everywhere = process supervision (#5).
+# Prereqs on the host: Docker, docker compose, nvidia-container-toolkit (for the GPU worker).
+#
+# Bring up:  docker compose up -d --build
+# Scale API: edit API_WORKERS (one container, N uvicorn workers — state is in Redis).
+# Scale GPU: raise `deploy.replicas` of `worker` (each holds ~5GB VRAM) OR swap the
+#            worker image for a batched backend (vLLM + batched whisper) on a bigger GPU.
+
+x-env: &env
+  REDIS_URL: redis://redis:6379
+  DATABASE_URL: postgresql://elderly:${DB_PASSWORD:-elderly_local_pw}@postgres:5432/elderly_care
+
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--maxmemory", "512mb", "--maxmemory-policy", "allkeys-lru"]
+    volumes: ["redis-data:/data"]
+
+  postgres:
+    image: postgres:16
+    restart: unless-stopped               # ← #5: Postgres auto-recovers (was Restart=no)
+    environment:
+      POSTGRES_USER: elderly
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-elderly_local_pw}
+      POSTGRES_DB: elderly_care
+    volumes: ["pg-data:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U elderly"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  mosquitto:
+    image: eclipse-mosquitto:2
+    restart: unless-stopped
+    ports: ["1883:1883"]
+    volumes: ["./mosquitto.conf:/mosquitto/config/mosquitto.conf:ro"]
+
+  # Janus + coturn need host networking: WebRTC media uses a wide UDP RTP range.
+  janus:
+    image: canyan/janus-gateway:latest      # or build from the official Dockerfile
+    restart: unless-stopped
+    network_mode: host                       # 8088 (HTTP) + 8188 (WS) + RTP udp range
+    volumes: ["./janus:/usr/local/etc/janus:ro"]
+    # In janus.jcfg set: nat_1_1_mapping = "<PUBLIC_IP>"   (so remote callers get a routable candidate)
+    #                    full_trickle = true; ice_ignore_list as needed
+
+  coturn:
+    image: coturn/coturn:latest              # ← #4: TURN relay for callers behind strict NAT
+    restart: unless-stopped
+    network_mode: host
+    volumes: ["./coturn.conf:/etc/coturn/turnserver.conf:ro"]
+
+  api:
+    build: { context: .., dockerfile: remote-docker/Dockerfile.api }
+    restart: unless-stopped
+    environment:
+      <<: *env
+      WAKE_NO_AUTO_WARMUP: "1"               # API holds NO models — the worker does
+      WORKERS: ${API_WORKERS:-4}             # N uvicorn workers (state shared via Redis)
+      # In-container path the app loads (fixed; matches the ro mount below).
+      FCM_KEY_FILE: /app/elderly-care-assistant.json
+    ports: ["5000:5000"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_started }
+    volumes:
+      - uploads:/app/uploads
+      # Firebase service-account key — gitignored + .dockerignore'd (never baked in),
+      # provided at runtime. Override the HOST path with FCM_KEY_FILE_HOST in .env.
+      - ${FCM_KEY_FILE_HOST:-../elderly-care-assistant.json}:/app/elderly-care-assistant.json:ro
+
+  worker:
+    build: { context: .., dockerfile: remote-docker/Dockerfile.worker }
+    restart: unless-stopped
+    environment:
+      <<: *env
+      WAKE_LLM_GGUF: ${LLM_GGUF:-/models/qwen2.5-7b-instruct-q4_k_m.gguf}
+      WAKE_WHISPER_DIR: /models/faster-whisper-large-v3
+      # 6 GB GPU: 7B only fits with PARTIAL offload (20). A 3B/1.5B fits fully (99) → ~2× faster.
+      WAKE_LLM_GPU_LAYERS: ${GPU_LAYERS:-20}
+      WAKE_WHISPER_DEVICE: cuda
+      WAKE_WHISPER_COMPUTE: int8_float16
+    depends_on:
+      redis: { condition: service_started }
+    volumes:
+      - ${MODELS_DIR:-../models}:/models:ro
+      - uploads:/app/uploads                 # shares wav files with the API (same box)
+    deploy:
+      replicas: 1                            # 6 GB fits ONE model copy — do NOT raise
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  pg-data:
+  redis-data:
+  uploads:

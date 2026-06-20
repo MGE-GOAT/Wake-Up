@@ -1,0 +1,9 @@
+# HTTP/REST transport — not used by the app (which uses WebSocket), but handy for
+# health checks / the device if it speaks the HTTP API. Served on :8088 at /janus.
+general: {
+	json = "indented"
+	base_path = "/janus"
+	http = true
+	port = 8088
+	https = false
+}

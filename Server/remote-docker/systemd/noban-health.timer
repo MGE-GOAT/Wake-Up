@@ -1,0 +1,7 @@
+[Unit]
+Description=Run the Noban health watchdog every 60s
+[Timer]
+OnBootSec=90
+OnUnitActiveSec=60
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,8 @@
+# WebSocket transport — the app (call_page.dart) connects here:
+#   ws://<server>:8188  with subprotocol "janus-protocol".
+general: {
+	json = "indented"
+	ws = true
+	ws_port = 8188
+	wss = false          # terminate TLS at a reverse proxy (wss://) in production
+}

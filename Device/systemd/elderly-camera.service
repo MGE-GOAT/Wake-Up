@@ -1,0 +1,11 @@
+[Unit]
+Description=Elderly-care CSI camera to v4l2loopback feeder
+After=systemd-modules-load.service
+[Service]
+User=pi
+ExecStart=/home/pi/device_bundle/Noban/run_camera.sh
+Restart=always
+RestartSec=3
+StartLimitIntervalSec=0
+[Install]
+WantedBy=multi-user.target

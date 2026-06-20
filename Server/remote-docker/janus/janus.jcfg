@@ -1,0 +1,48 @@
+# Janus core config — Noban VideoRoom SFU.
+# Mounted by docker-compose at /usr/local/etc/janus (read-only), which SHADOWS the
+# image defaults — so the core + transport + plugin .jcfg files must all live here.
+# Janus runs with network_mode: host (it needs the wide UDP RTP range + 8088/8188).
+
+general: {
+	configs_folder = "/usr/local/etc/janus"
+	plugins_folder = "/usr/local/lib/janus/plugins"
+	transports_folder = "/usr/local/lib/janus/transports"
+	events_folder = "/usr/local/lib/janus/events"
+	loggers_folder = "/usr/local/lib/janus/loggers"
+	debug_level = 4
+	server_name = "noban-janus"
+}
+
+media: {
+	# RTP/RTCP port range for media. Open this UDP range in the host firewall.
+	rtp_port_range = "20000-40000"
+}
+
+nat: {
+	# Trickle ICE incrementally — recommended, and required by the app's WS flow.
+	full_trickle = true
+	ice_lite = false
+	ice_tcp = false
+
+	# ── REMOTE deployments only ──────────────────────────────────────────────
+	# Advertise the server's PUBLIC IP so off-network callers get a routable
+	# candidate. Leave commented for LAN-only use (host candidates suffice).
+	# nat_1_1_mapping = "PUBLIC_IP"
+	#
+	# Optionally relay through the bundled coturn for strict/symmetric NAT
+	# (fill PUBLIC_IP + the secret in coturn.conf to match):
+	# stun_server = "PUBLIC_IP"
+	# stun_port = 3478
+	# turn_server = "PUBLIC_IP"
+	# turn_port = 3478
+	# turn_type = "udp"
+	# turn_user = "noban"
+	# turn_pwd = "CHANGE_ME_STRONG_SECRET"
+}
+
+plugins: {
+	# Only the VideoRoom plugin is used; any others present load with defaults.
+}
+
+transports: {
+}
