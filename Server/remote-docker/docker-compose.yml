@@ -21,13 +21,17 @@ services:
     volumes: ["redis-data:/data"]
 
   postgres:
-    image: postgres:16
+    image: postgres:18
     restart: unless-stopped               # ← #5: Postgres auto-recovers (was Restart=no)
     environment:
       POSTGRES_USER: elderly
       POSTGRES_PASSWORD: ${DB_PASSWORD:-elderly_local_pw}
       POSTGRES_DB: elderly_care
-    volumes: ["pg-data:/var/lib/postgresql/data"]
+    # PG18's Docker image changed its data-dir layout: PGDATA moved to a versioned
+    # subdir (/var/lib/postgresql/18/docker) and the declared VOLUME is now
+    # /var/lib/postgresql. Mount the named volume at /var/lib/postgresql (NOT
+    # /var/lib/postgresql/data) — the old path no longer persists the live data on PG18.
+    volumes: ["pg-data:/var/lib/postgresql"]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U elderly"]
       interval: 10s

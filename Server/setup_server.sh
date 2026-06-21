@@ -169,13 +169,11 @@ cat <<DONE
  Noban server provisioned. Remaining manual steps:
    1. Fill in secrets.env (SMTP for verification emails).
    2. Provide the Firebase key (see REQUIRED_FILES.md) for push notifications.
-   3. Point run_async.sh / run_worker.sh at this venv (or 'conda activate app'):
-        the scripts default to a conda env — set CONDA_ROOT/CONDA_ENV, or edit
-        them to use ${VENV_DIR}/bin/python.
-   4. Start (two terminals, worker FIRST so models warm):
-        bash run_worker.sh          # wait for "models ready"
-        bash local-lan/run_async.sh # wait for "asyncpg pool ready"
-   5. Health check:  curl -s -o /dev/null -w '%{http_code}\\n' \\
+   3. Start it (the run scripts auto-use the .venv created above — no extra setup).
+      Two terminals, worker FIRST so the models warm up:
+        bash local-lan/run_worker.sh   # wait for "models ready"  (needs a GPU)
+        bash local-lan/run_async.sh    # wait for "asyncpg pool ready"
+   4. Health check:  curl -s -o /dev/null -w '%{http_code}\\n' \\
         -X POST http://localhost:${SERVER_PORT:-5000}/Pill_Status_App \\
         -H 'Username: x' -H 'Password: x'   # → 403 = healthy
 ──────────────────────────────────────────────────────────────────────────────
