@@ -83,6 +83,22 @@ ok()  { echo -e "    \033[1;32m✓\033[0m $*"; }
 
 say "Noban device provisioning — server=${SERVER_URL} mqtt=${MQTT_HOST}:${MQTT_PORT} bundle=${NOBAN_DIR}"
 
+# -----------------------------------------------------------------------------
+# Keep sudo alive for the WHOLE run. This script needs root (apt / systemd / /etc),
+# but the TFLite build (stage 3d) takes ~30 min with no sudo calls in between —
+# long enough for the sudo timestamp to expire, after which a later step would
+# re-prompt (and hang if you walked away) or fail outright. So authenticate ONCE
+# up front, then refresh the timestamp in the background until the script exits.
+# => One password prompt for the entire run; safe to start it and walk away.
+if ! sudo -n true 2>/dev/null; then
+    echo "This setup needs administrator rights. Enter your password once —"
+    echo "it stays valid for the whole install (you won't be asked again):"
+    sudo -v
+fi
+( while true; do sudo -n true 2>/dev/null || true; sleep 50; kill -0 "$$" 2>/dev/null || exit 0; done ) &
+SUDO_KEEPALIVE_PID=$!
+trap 'kill "$SUDO_KEEPALIVE_PID" 2>/dev/null || true' EXIT
+
 # =============================================================================
 # 1. APT DEPENDENCIES
 #    Build/runtime deps from setup.sh (verified against setup.log: cmake,
