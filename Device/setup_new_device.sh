@@ -383,20 +383,36 @@ if [ ! -f deps/tflite/lib/libtensorflow-lite.a ]; then
 
       cmake --build . -j"$(nproc)"
 
-      # Stage the single static lib + headers where CMakeLists expects them.
-      mkdir -p ../../tflite/lib ../../tflite/include
+      # Stage the single static lib where CMakeLists expects it (deps/tflite/lib).
+      mkdir -p ../../tflite/lib
       cp libtensorflow-lite.a ../../tflite/lib/ )
+    ok "TFLite ${TFLITE_BRANCH} built"
+else
+    ok "TFLite lib already built"
+fi
 
-    ( cd deps/tensorflow-src
-      find tensorflow/lite -name "*.h" | while read -r f; do
-          dest="../../tflite/include/$f"
+# Stage the TFLite HEADERS into deps/tflite/include (CMakeLists adds this dir to
+# the include path; tensorflow/lite/interpreter.h et al MUST land here or the
+# pipeline fails to compile). Run this OUTSIDE the build guard + only-if-missing,
+# so a re-run that already has the prebuilt lib still heals a missing-headers tree.
+# CAREFUL: this subshell runs in deps/tensorflow-src, so the include dir is ONE
+# '..' up (../tflite/include = deps/tflite/include). The build subshell above runs
+# one level deeper (deps/tensorflow-src/tflite_build) where the same dir is ../../
+# — using ../../ here (the old bug) staged headers to Noban/tflite/include and the
+# compile then could not find interpreter.h.
+if [ ! -f deps/tflite/include/tensorflow/lite/interpreter.h ]; then
+    echo "    staging TFLite headers -> deps/tflite/include"
+    mkdir -p deps/tflite/include
+    ( cd deps/tensorflow-src 2>/dev/null && find tensorflow/lite -name "*.h" | while read -r f; do
+          dest="../tflite/include/$f"
           mkdir -p "$(dirname "$dest")"
           cp "$f" "$dest"
       done )
-    ok "TFLite ${TFLITE_BRANCH} built + staged"
-else
-    ok "TFLite already built"
 fi
+[ -f deps/tflite/include/tensorflow/lite/interpreter.h ] \
+    || { echo "ERROR: TFLite headers missing from deps/tflite/include (staging failed)." >&2; \
+         echo "       Make sure deps/tensorflow-src exists, then re-run this script." >&2; exit 1; }
+ok "TFLite headers staged (deps/tflite/include)"
 
 # =============================================================================
 # 4. BUILD THE PIPELINE (CMake)
