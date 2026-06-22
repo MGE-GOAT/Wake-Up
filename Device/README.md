@@ -73,7 +73,7 @@ TFLite is pinned to **r2.13** (newer kernels drift int8 outputs and flip predict
 
 ## From-scratch setup (`setup_new_device.sh`)
 
-Takes a fresh **Raspberry Pi OS (Trixie, 64-bit / arm64)** install on a Pi 4 or 5 all the
+Takes a fresh **Raspberry Pi OS (Bookworm, 64-bit / arm64)** install on a Pi 4 or 5 all the
 way to a running device. It is **idempotent** — safe to re-run.
 
 ```bash
@@ -110,7 +110,7 @@ sudo reboot
 ### What the script installs / configures
 
 - **apt dependencies** — build tools + CMake, OpenCV, libcurl, OpenSSL, ALSA,
-  `libgpiod-dev` (button/LED on Trixie), `libsodium-dev` (E2E media crypto),
+  `libgpiod-dev` (button/LED — the code auto-detects libgpiod 1.x on Bookworm or 2.x on Trixie), `libsodium-dev` (E2E media crypto),
   `paho-mqtt-cpp`, NetworkManager, ffmpeg + rpicam (camera), bluez (BLE), Python deps.
 - **Boot / audio config** (from `system-config/`) — `config.txt`
   (`dtoverlay=googlevoicehat-soundcard` for the INMP441 mic + MAX98357A amp,

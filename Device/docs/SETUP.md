@@ -130,7 +130,7 @@ from source into `Noban/deps/`:
 | **OpenCV** (core/imgproc/imgcodecs/videoio) | system | All fall-detection frame ops (`CMakeLists.txt:99-102`) |
 | **libcurl** | system | Server HTTP (`CMakeLists.txt:108-111`) |
 | **OpenSSL (libcrypto)** | system | SHA-256 of device password for `Key-Hash` (`CMakeLists.txt:115-117`) |
-| **libgpiod v2** | system (`libgpiod-dev`) | Button + RGB LED on Pi OS Trixie (sysfs GPIO removed). Absent → button falls back to SIGUSR1, LED to print-only (`CMakeLists.txt:50-61`) |
+| **libgpiod v1/v2** | system (`libgpiod-dev`) | Button + RGB LED (modern sysfs GPIO removed). `gpio_io.cpp` auto-detects the API at build time — libgpiod 1.x on Bookworm, 2.x on Trixie. Absent → button falls back to SIGUSR1, LED to print-only (`CMakeLists.txt:50-61`) |
 | **libsodium** | system (`libsodium-dev`) | E2E media crypto. Absent → plaintext media + warning (`CMakeLists.txt:63-74`) |
 | **paho-mqtt-cpp** | system (`libpaho-mqttpp-dev`) | MQTT transport. Absent → compiles as no-op stub, `HAVE_MQTT=0` (`CMakeLists.txt:76-92`) |
 | **ALSA / pthread / dl / m** | system | Audio + runtime (`CMakeLists.txt:228-229`) |
@@ -151,7 +151,7 @@ from source into `Noban/deps/`:
 > x86_64 Kali laptop (wrong ONNX Runtime arch for the Pi). For a real device,
 > **`../setup_new_device.sh`** (repo root, a sibling to `Noban/`) is the
 > **complete, from-scratch, idempotent** provisioner: it takes a fresh
-> Raspberry Pi OS (Trixie, 64-bit / arm64) install on a Pi 4/5 all the way to a
+> Raspberry Pi OS (Bookworm, 64-bit / arm64) install on a Pi 4/5 all the way to a
 > running device. It is the real setup path — the manual steps in this section
 > are the underlying detail it automates. The script:
 > - apt-installs all build + runtime deps (incl. `libgpiod-dev`, `libssl-dev`,
