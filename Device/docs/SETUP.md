@@ -18,6 +18,25 @@ operations.
 
 ---
 
+## 0. ⚠ OS requirement — Raspberry Pi OS **Bookworm**, not Trixie
+
+Flash **Raspberry Pi OS Bookworm (Debian 12), 64-bit / arm64** (last known-good:
+`2025-05-13-raspios-bookworm-arm64`, Desktop). **Do not use Trixie (Debian 13).**
+
+Trixie's **BlueZ 5.82** uses BLE **extended advertising** and rejects the device's
+connectable provisioning advertisement (`Failed to add advertisement: Invalid Parameters
+(0x0d)`), so the button→BLE/app onboarding (`ble_provisioning.py`) never advertises and a
+fresh unit can't be onboarded. **Bookworm's BlueZ 5.66** uses legacy advertising and the same
+code works. There is no config knob to force legacy advertising on 5.82; the bug is
+acknowledged upstream (RPi `linux#7098`). Wake word / fall / calls / pills work on either OS —
+only BLE onboarding is affected. (Root-caused + verified June 2026 on a Pi 4 / BCM4345C0.)
+
+Recovery if a device is already on Trixie: register it server-side directly (insert into the
+server's `devices` table with `key_hash = sha256(<32-char id.txt secret>)` + a `subscriptions`
+row) instead of onboarding over BLE.
+
+---
+
 ## 1. Hardware & wiring
 
 | Peripheral | Part | Bus / pins | Notes |

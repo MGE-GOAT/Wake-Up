@@ -3,8 +3,16 @@
 # setup_new_device.sh — provision a BRAND-NEW Raspberry Pi into a running
 #                        Noban elderly-care device.
 #
+# ⚠ OS REQUIREMENT — USE RASPBERRY PI OS *BOOKWORM* (Debian 12), 64-bit / arm64.
+#   Do NOT use Trixie (Debian 13). Trixie ships BlueZ 5.82, which uses LE
+#   *extended* advertising and REJECTS the device's connectable provisioning
+#   advert ("Failed to add advertisement: Invalid Parameters (0x0d)"), so the
+#   button→BLE/app onboarding (ble_provisioning.py) silently never advertises.
+#   Bookworm ships BlueZ 5.66 (legacy advertising), where onboarding works.
+#   (Root-caused + verified June 2026 on a Pi 4 / BCM4345C0; see docs/SETUP.md.)
+#
 # WHAT THIS DOES
-#   Takes a fresh Raspberry Pi OS (Trixie, 64-bit / arm64) install and brings
+#   Takes a fresh Raspberry Pi OS (Bookworm, 64-bit / arm64) install and brings
 #   it all the way to a fully running Noban device: apt deps, i2s/i2c boot
 #   config + ALSA routing for the INMP441 mic and MAX98357A amp, the native
 #   deps (rnnoise, pocketfft, ONNX Runtime, TFLite r2.13), the CMake build of
@@ -20,10 +28,10 @@
 #   - Noban/wake_call_helper.py, ble_provisioning.py, show_noban.py (python deps)
 #
 # ASSUMPTIONS
-#   * Raspberry Pi 4 or 5, 64-bit Raspberry Pi OS (Trixie). The setup.log shows
-#     the device was built on Trixie arm64. (setup.sh's header says "Kali x86_64"
-#     and downloads the x64 ONNX Runtime — that is wrong for the Pi; this script
-#     fixes it by selecting the aarch64 ORT build.)
+#   * Raspberry Pi 4 or 5, 64-bit Raspberry Pi OS *BOOKWORM* (see OS REQUIREMENT
+#     above — Trixie's BlueZ 5.82 breaks BLE onboarding). (setup.sh's header says
+#     "Kali x86_64" and downloads the x64 ONNX Runtime — that is wrong for the Pi;
+#     this script fixes it by selecting the aarch64 ORT build.)
 #   * Run as the 'pi' user (the systemd units hard-code User=pi and
 #     /home/pi/device_bundle/Noban). Has sudo. Network reachable (deps are
 #     cloned/downloaded from github at build time).

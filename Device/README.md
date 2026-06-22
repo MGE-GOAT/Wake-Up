@@ -24,6 +24,27 @@ Runs as systemd services (`elderly-pipeline`, `elderly-camera`, `elderly-call-da
 
 ---
 
+## ⚠ OS requirement — Raspberry Pi OS **Bookworm** (NOT Trixie)
+
+Flash **Raspberry Pi OS Bookworm (Debian 12), 64-bit / arm64**. **Do not use Trixie
+(Debian 13).** Last known-good image: **`2025-05-13-raspios-bookworm-arm64`** (Desktop, 64-bit).
+
+**Why (root-caused + verified June 2026 on a Pi 4 / BCM4345C0):** Trixie ships **BlueZ 5.82**,
+which uses BLE **extended** advertising and rejects the device's *connectable* provisioning
+advert with `Failed to add advertisement: Invalid Parameters (0x0d)`. The effect: the
+button→BLE/app onboarding (`ble_provisioning.py`) **silently never advertises**, so a fresh
+unit can't be onboarded. **Bookworm ships BlueZ 5.66** (legacy advertising) — the *exact same*
+device + app code advertises and onboards fine there.
+
+- There is **no BlueZ config knob** to force legacy advertising on 5.82 (confirmed against the
+  `LEAdvertisingManager` API); the only Trixie fixes are forking/patching BlueZ — not worth it.
+- The bug is acknowledged upstream: RPi [`linux#7098`](https://github.com/raspberrypi/linux/issues/7098).
+- Everything *else* (wake word, fall, calls, pills) works on Trixie too — it's **only** BLE
+  onboarding that breaks. If you're ever stuck on Trixie, a device can be registered
+  server-side directly instead of via BLE (the server's `devices` + `subscriptions` tables).
+
+---
+
 ## Repository layout
 
 | Path | What it is |
