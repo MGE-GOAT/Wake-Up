@@ -1443,12 +1443,58 @@ void setLed(LedColor c) {
     gpioio::led(c == LedColor::RED, c == LedColor::GREEN, c == LedColor::BLUE);
 }
 
-// Mode-aware LED colours. Guest/sleep mode recolours the idle + record-active
-// states so the elder/caregiver can tell at a glance that the device is in
-// privacy mode: idle is RED in guest (vs GREEN normal), and a record-active
-// flash is BLUE in guest (vs RED normal). g_guest_mode is declared earlier.
-LedColor idleColor() { return g_guest_mode.load() ? LedColor::RED : LedColor::GREEN; }
-LedColor recColor()  { return g_guest_mode.load() ? LedColor::BLUE : LedColor::RED; }
+// LED scheme:
+//   • normal idle      = BLUE   (device on + working, listening)
+//   • recording audio  = GREEN  (wake command after "Noban"/"Hey Noban", and
+//                                the post-fall "speak now" recording)
+//   • guest/sleep idle = RED    (privacy mode — caregiver can tell at a glance)
+//   • BLE setup        = blinking BLUE (see runWifiSetup / LedBlinker)
+// g_guest_mode is declared earlier.
+LedColor idleColor() { return g_guest_mode.load() ? LedColor::RED : LedColor::BLUE; }
+LedColor recColor()  { return LedColor::GREEN; }
+
+// ── OLED interactive "eyes" ────────────────────────────────────────────────
+// The eyes are drawn by a separate persistent daemon (oled_eyes.py) that polls
+// a tiny state file; the pipeline just writes the current state here at each
+// transition. States:
+//   "none"    blank screen — unprovisioned / BLE setup / factory reset / reboot
+//   "idle"    open eyes (provisioned, listening)
+//   "happy"   heard its name "Noban" (normal wake) — happy + focusing
+//   "listen"  woke from sleep on "Hey Noban" (guest) — awake + listening
+//   "sleep"   guest/sleep mode (eyes closed)
+//   "worried" post-fall "speak now" recording
+static void setOled(const char* state) {
+    const char* f = std::getenv("OLED_STATE_FILE");
+    std::string path = f ? f : "/tmp/noban_oled_state";
+    std::string tmp  = path + ".tmp";
+    std::ofstream o(tmp, std::ios::trunc);
+    if (o) {
+        o << state << "\n";
+        o.close();
+        std::rename(tmp.c_str(), path.c_str());   // atomic swap for the reader
+    }
+    std::cout << "[OLED] " << state << "\n";
+}
+
+// Blink the LED a colour on a background thread until destroyed. Used to show
+// "blinking blue" while BLE/Wi-Fi setup runs (runWifiSetup blocks on the
+// sidecar, so a thread drives the blink).
+struct LedBlinker {
+    std::atomic<bool> stop_{false};
+    std::thread th_;
+    void start(LedColor c) {
+        th_ = std::thread([this, c] {
+            bool on = true;
+            while (!stop_.load()) {
+                setLed(on ? c : LedColor::OFF);
+                on = !on;
+                for (int i = 0; i < 5 && !stop_.load(); ++i)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(80));
+            }
+        });
+    }
+    ~LedBlinker() { stop_.store(true); if (th_.joinable()) th_.join(); }
+};
 
 // recordCommand pulls RECORD_SECONDS of post-wake audio from the AudioRing in
 // ~100ms slices so the caller can preempt mid-record (the fall-preempts-wake
@@ -1749,6 +1795,7 @@ private:
 static void doFactoryReset() {
     std::cout << "\n[button] FACTORY RESET requested — confirming purge with server FIRST\n";
     setLed(LedColor::RED);
+    setOled("none");   // maintenance action → no eyes (restored below only if aborted)
     // Wipe the local identity ONLY AFTER the server confirms it purged this
     // device's data. The device loses its creds on wipe and can't retry, so a
     // flaky network here would otherwise orphan everything server-side. We retry
@@ -1795,7 +1842,8 @@ static void doFactoryReset() {
             setLed(LedColor::BLUE); std::this_thread::sleep_for(std::chrono::milliseconds(150));
             setLed(LedColor::OFF);  std::this_thread::sleep_for(std::chrono::milliseconds(150));
         }
-        setLed(LedColor::GREEN);                       // back to idle
+        setLed(idleColor());                           // back to idle (device intact)
+        setOled(g_guest_mode.load() ? "sleep" : "idle");   // eyes back
         return;
     }
     std::cout << "[button] server confirmed purge — wiping id.txt + Wi-Fi, rebooting\n";
@@ -1814,6 +1862,7 @@ static void doFactoryReset() {
 static void doReboot() {
     std::cout << "\n[button] REBOOT — graceful restart\n";
     setLed(LedColor::RED);
+    setOled("none");   // no eyes while rebooting
     std::system("sync");
     std::system("sudo systemctl reboot --no-block");
 }
@@ -1833,7 +1882,7 @@ static void doReboot() {
 // sets it during the hold), then goes back to GREEN on success.
 static bool runWifiSetup() {
     std::cout << "\n[setup] button-hold released — entering setup mode\n";
-    setLed(LedColor::BLUE);
+    setOled("none");                 // no eyes while unprovisioned / in setup
 
     auto exists = [](const char* p) {
         std::ifstream f(p); return f.good();
@@ -1844,26 +1893,33 @@ static bool runWifiSetup() {
     const char* legacy_local  = "./wifi_setup.sh";
 
     int rc = 1;
-    std::string path;
-    if      (exists(ble_installed)) path = ble_installed;
-    else if (exists(ble_local))     path = ble_local;
-    if (!path.empty()) {
-        std::string cmd = "python3 " + path;
-        std::cout << "[setup] launching BLE sidecar: " << cmd << "\n";
-        rc = std::system(cmd.c_str());
-    } else if (exists(legacy_inst) || exists(legacy_local)) {
-        std::string p = exists(legacy_inst) ? legacy_inst : legacy_local;
-        std::cout << "[setup] BLE sidecar not found, falling back to legacy "
-                     "AP-mode wifi_setup.sh\n";
-        std::string cmd = "DEVICE_ID=" + std::string(DEVICE_ID) + " " + p;
-        rc = std::system(cmd.c_str());
-    } else {
-        std::cout << "[setup-DEV] no setup script found — simulating (5 s)\n";
-        std::this_thread::sleep_for(std::chrono::seconds(5));
-        rc = 0;
-    }
+    {
+        // Blinking blue for the whole setup window. Scoped so the blinker thread
+        // is stopped/joined before we set the final solid LED below (no race).
+        LedBlinker blink;
+        blink.start(LedColor::BLUE);
 
-    setLed(LedColor::GREEN);
+        std::string path;
+        if      (exists(ble_installed)) path = ble_installed;
+        else if (exists(ble_local))     path = ble_local;
+        if (!path.empty()) {
+            std::string cmd = "python3 " + path;
+            std::cout << "[setup] launching BLE sidecar: " << cmd << "\n";
+            rc = std::system(cmd.c_str());
+        } else if (exists(legacy_inst) || exists(legacy_local)) {
+            std::string p = exists(legacy_inst) ? legacy_inst : legacy_local;
+            std::cout << "[setup] BLE sidecar not found, falling back to legacy "
+                         "AP-mode wifi_setup.sh\n";
+            std::string cmd = "DEVICE_ID=" + std::string(DEVICE_ID) + " " + p;
+            rc = std::system(cmd.c_str());
+        } else {
+            std::cout << "[setup-DEV] no setup script found — simulating (5 s)\n";
+            std::this_thread::sleep_for(std::chrono::seconds(5));
+            rc = 0;
+        }
+    }   // blinker stopped + joined here
+
+    setLed(idleColor());
     if (rc == 0) {
         std::cout << "[setup] completed (rc=0) — applying new creds.\n";
         // Cleanest way to "rerun with the new creds": if we're managed by
@@ -2099,11 +2155,11 @@ void buttonThread(std::atomic<bool>& running) {
             case ButtonGesture::REBOOT:        doReboot();       break;
             case ButtonGesture::FACTORY_RESET: doFactoryReset(); break;
             case ButtonGesture::ENTER_GUEST:
-                g_guest_mode.store(true);  setLed(LedColor::RED);
+                g_guest_mode.store(true);  setLed(LedColor::RED); setOled("sleep");
                 std::cout << "[guest] SLEEP — fall+camera paused; wake is double-gated (\"Hey\"+\"Noban\"); press once to wake\n";
                 break;
             case ButtonGesture::WAKE:
-                g_guest_mode.store(false); setLed(LedColor::GREEN);
+                g_guest_mode.store(false); setLed(idleColor()); setOled("idle");
                 std::cout << "[guest] WAKE — monitoring resumed\n";
                 break;
             case ButtonGesture::NONE: break;
@@ -2138,10 +2194,10 @@ void housekeepingThread(std::atomic<bool>& running, std::shared_ptr<ServerComman
             // which syncs every caregiver's UI. Applied BEFORE the gated actions
             // below so a SLEEP command silences this same cycle.
             if (st.guest_cmd == 1 && !g_guest_mode.load()) {
-                g_guest_mode.store(true);  setLed(LedColor::RED);
+                g_guest_mode.store(true);  setLed(LedColor::RED); setOled("sleep");
                 std::cout << "[guest] SLEEP via app — fall+camera paused; wake double-gated (\"Hey\"+\"Noban\")\n";
             } else if (st.guest_cmd == 0 && g_guest_mode.load()) {
-                g_guest_mode.store(false); setLed(LedColor::GREEN);
+                g_guest_mode.store(false); setLed(idleColor()); setOled("idle");
                 std::cout << "[guest] WAKE via app — monitoring resumed\n";
             }
             if (st.image_req_id >= 0 && !g_guest_mode.load()) {  // no snapshots while asleep (privacy)
@@ -2618,6 +2674,7 @@ int main(int argc, char** argv) {
     // In that state we must NOT start MQTT / models / server polling — run ONLY
     // the BLE provisioning sidecar, looping until it writes a real id.txt (at
     // which point runWifiSetup() reloads the identity or systemd restarts us).
+    setOled("none");   // unprovisioned → no eyes until setup completes
     while (g_device_id == FACTORY_ID) {
         std::cerr << "[id] UNPROVISIONED — entering BLE setup; server endpoints "
                      "stay disabled until provisioned.\n";
@@ -2746,7 +2803,8 @@ int main(int argc, char** argv) {
     }
 
     std::cout<<"\n✅ All models loaded. Starting pipeline.\n";
-    setLed(LedColor::GREEN);   // GREEN = idle/listening
+    setLed(idleColor());   // BLUE = idle/listening (RED in guest)
+    setOled(g_guest_mode.load() ? "sleep" : "idle");
 
     // Open ALSA capture handle right here in main. WUW inference runs in this
     // same thread; the 300ms blocking read paces everything. Saves one
@@ -2849,9 +2907,11 @@ int main(int argc, char** argv) {
         // WUW. Sticky fall=1 will NOT keep retriggering. ────────────────
         if (pain::g_fall.load() != 0) {
             std::cout << "\n[fall=1] pausing WUW, entering pain session.\n";
-            // LED red for the whole pain session (beeps + "speak now" recording),
-            // mirroring the wake-word handling. Restored to GREEN at session end.
-            setLed(LedColor::RED);
+            // GREEN = recording for the whole pain session (beeps + "speak now"),
+            // mirroring the wake-word handling. Eyes go "worried" during the
+            // post-fall check. Restored to idle at session end.
+            setLed(recColor());
+            setOled("worried");
             // Pain reads the SAME ring T1 is filling (T1 keeps the mic). Give it
             // its own cursor starting at "now" so warmup begins on live audio.
             uint64_t pain_cursor = g_audio_ring.now();
@@ -2879,9 +2939,10 @@ int main(int argc, char** argv) {
             pain::g_fall.store(0);
             if (!fallRunning.load()) break;
 
-            // Pain session over: GREEN = pain done + WUW back on (covers both
+            // Pain session over: back to idle + WUW back on (covers both
             // direct fall->pain and wake-preempted-by-fall->pain paths).
-            setLed(LedColor::GREEN);
+            setLed(idleColor());
+            setOled(g_guest_mode.load() ? "sleep" : "idle");
             // PAUSE-DON'T-RESET: WUW state (PCEN M, mel buffer, EMAs, cooldown,
             // schmitt) is preserved. Jump the cursor to live audio (T1 reopens
             // the mic now that g_fall cleared) so we don't replay the session.
@@ -2982,10 +3043,12 @@ int main(int argc, char** argv) {
             printf("\n\n🔔 WAKE WORD DETECTED! (ema_w=%.3f  margin=%.3f)\n",
                    ema_wake, margin);
 
-            // LED record-active for the entire wake handling — turns back to
-            // idle at the very end (or when fall preempts). Mode-aware: BLUE in
-            // guest, RED in normal.
+            // GREEN (recording) for the entire wake handling — turns back to
+            // idle at the very end (or when fall preempts). Eyes: "happy" when
+            // it hears its name normally; in guest it just woke from sleep on
+            // "Hey Noban" so it's "listen"ing.
             setLed(recColor());
+            setOled(g_guest_mode.load() ? "listen" : "happy");
             // T1 keeps owning micleft and filling the ring; recordCommand reads
             // the post-wake audio straight from it — no mic open/close churn.
             playAlarm();
@@ -3032,8 +3095,10 @@ int main(int argc, char** argv) {
                 // pain branch turns it back to GREEN and resumes WUW.
             } else {
                 // Idle = wake-handling done AND WUW pipeline back on
-                // (GREEN normal / RED guest).
+                // (BLUE normal / RED guest). Eyes go back to open (idle) or,
+                // if we're in guest/sleep, back to sleeping.
                 setLed(idleColor());
+                setOled(g_guest_mode.load() ? "sleep" : "idle");
             }
 
             // PAUSE-DON'T-RESET: preserve PCEN M, mel buffer, EMAs.

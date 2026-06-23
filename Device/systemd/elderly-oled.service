@@ -1,0 +1,18 @@
+[Unit]
+Description=Noban OLED interactive eyes (renders the eye state the pipeline writes)
+After=elderly-pipeline.service
+# Independent of the pipeline's health: the daemon shows a blank screen until
+# the pipeline writes a state, and clears the screen on stop (shutdown/reboot).
+
+[Service]
+User=pi
+WorkingDirectory=/home/pi/device_bundle/Noban
+Environment=OLED_STATE_FILE=/tmp/noban_oled_state
+ExecStart=/usr/bin/python3 /home/pi/device_bundle/Noban/oled_eyes.py
+Restart=always
+RestartSec=5
+# Don't let early-boot I2C readiness hiccups trip the start rate-limit.
+StartLimitIntervalSec=0
+
+[Install]
+WantedBy=multi-user.target

@@ -454,13 +454,15 @@ mkdir -p build
 # =============================================================================
 # 5. SYSTEMD UNITS
 #    Copy from ./systemd, enable elderly-camera, elderly-pipeline,
-#    elderly-call-daemon, and the watchdog timer. The pipeline drop-in override
-#    (Environment=, ExecStartPost OLED) is copied with the unit.
+#    elderly-call-daemon, elderly-oled (interactive OLED eyes), and the watchdog
+#    timer. The pipeline drop-in override (Environment=, OLED state file) is
+#    copied with the unit.
 # =============================================================================
 say "[5/8] install systemd units"
 sudo cp "${SYSTEMD_SRC}/elderly-pipeline.service"     /etc/systemd/system/
 sudo cp "${SYSTEMD_SRC}/elderly-camera.service"       /etc/systemd/system/
 sudo cp "${SYSTEMD_SRC}/elderly-call-daemon.service"  /etc/systemd/system/
+sudo cp "${SYSTEMD_SRC}/elderly-oled.service"         /etc/systemd/system/
 sudo cp "${SYSTEMD_SRC}/noban-watchdog.service"       /etc/systemd/system/
 sudo cp "${SYSTEMD_SRC}/noban-watchdog.timer"         /etc/systemd/system/
 sudo mkdir -p /etc/systemd/system/elderly-pipeline.service.d
@@ -493,8 +495,17 @@ fi
 
 sudo systemctl daemon-reload
 sudo systemctl enable elderly-camera.service elderly-pipeline.service \
-                      elderly-call-daemon.service noban-watchdog.timer
+                      elderly-call-daemon.service elderly-oled.service \
+                      noban-watchdog.timer
 ok "units installed + enabled"
+
+# Persistent journald — the default journal is volatile (RAM) and is wiped on
+# every reboot, which hides exactly the crash-loop logs we need to debug. Make
+# it persistent so `journalctl -b -1` survives across reboots.
+sudo mkdir -p /var/log/journal
+sudo systemd-tmpfiles --create --prefix /var/log/journal 2>/dev/null || true
+sudo systemctl kill -s USR1 systemd-journald 2>/dev/null || true
+ok "persistent journald enabled (/var/log/journal)"
 
 # =============================================================================
 # 6. POINT THE DEVICE AT THE SERVER

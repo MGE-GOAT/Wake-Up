@@ -29,6 +29,31 @@ if mic_contention; then
   exit 0
 fi
 
+# C) crash-loop AFTER coming up: systemd Restart=always silently respawns a
+#    crashing pipeline every RestartSec forever (e.g. a wedged i2s/ALSA state
+#    after a power event). reached_listening() can't see this — the boot journal
+#    still holds an old "Listening" line — so detect a BURST of restarts within
+#    one tick and reboot once (capped) to clear it, like (B).
+RST=/var/lib/elderly-care/wd_restarts
+now_r=$(systemctl show -p NRestarts --value elderly-pipeline 2>/dev/null || echo 0)
+prev_r=$(cat "$RST" 2>/dev/null || echo "$now_r")
+echo "$now_r" > "$RST"
+# Only act when the counter advanced (it resets to 0 on a real reboot, so a
+# negative delta = post-reboot, ignore). >=3 restarts in one 60s tick = looping.
+if [ "${now_r:-0}" -ge "${prev_r:-0}" ] 2>/dev/null; then
+  if [ "$(( now_r - prev_r ))" -ge 3 ]; then
+    n=$(cat "$CNT" 2>/dev/null || echo 0); n=$((n + 1))
+    if [ "$n" -gt "$MAX" ]; then
+      logger -t noban-watchdog "crash-loop ($((now_r - prev_r)) restarts/tick) but reboot cap ($MAX) reached — manual attention needed"
+      exit 0
+    fi
+    echo "$n" > "$CNT"
+    logger -t noban-watchdog "crash-loop ($((now_r - prev_r)) restarts/tick) — reboot #$n/$MAX to clear it"
+    sync; sleep 2; systemctl reboot
+    exit 0
+  fi
+fi
+
 # B) never came up → reboot once (capped)
 if ! reached_listening; then
   n=$(cat "$CNT" 2>/dev/null || echo 0); n=$((n + 1))
