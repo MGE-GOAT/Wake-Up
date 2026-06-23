@@ -173,6 +173,10 @@ static std::string g_mac;             // stable wlan MAC — sent in Device-Mac 
 // the elder unmonitored.
 std::atomic<bool> g_guest_mode{false};
 
+// True only when stdout is an interactive terminal. Used to suppress the live
+// per-stride '\r' WUW meter under systemd (where it would flood journald).
+static const bool g_stdout_is_tty = isatty(fileno(stdout));
+
 // Read the device's stable hardware MAC (wlan0 preferred, then eth0/end0). The
 // server uses it to recognize a re-provisioned device (same MAC, new id) and
 // purge the old identity's data. Returns "" if no interface is found.
@@ -2242,8 +2246,14 @@ void housekeepingThread(std::atomic<bool>& running, std::shared_ptr<ServerComman
                               << " upload " << (ok ? "OK" : "FAILED")
                               << " (" << jpeg.size() << " B)\n";
                 } else {
-                    std::cout << "[snapshot] image_req_id=" << st.image_req_id
-                              << " but no camera frame available yet\n";
+                    // Log once per distinct request id — the server re-asks every
+                    // heartbeat until a frame arrives, so without this it spams.
+                    static int last_noframe_id = -1;
+                    if (st.image_req_id != last_noframe_id) {
+                        last_noframe_id = st.image_req_id;
+                        std::cout << "[snapshot] image_req_id=" << st.image_req_id
+                                  << " but no camera frame available yet\n";
+                    }
                 }
             }
             // Pill alarms: play each due one (per-ID 5-min cooldown), sequentially
@@ -3038,10 +3048,16 @@ int main(int argc, char** argv) {
 
         if (cooldown > 0) cooldown--;
 
-        printf("  w=%.2f m=%.2f %s cd=%d\r",
-               ema_wake, margin,
-               schmitt_armed ? "ARM" : "off", cooldown);
-        fflush(stdout);
+        // Live per-stride meter — only to an interactive terminal. Under systemd
+        // there's no TTY, and the trailing '\r' makes journald log every stride
+        // as a "[blob data]" entry, flooding the journal many times/sec (which
+        // also evicted the one-time "Listening" line and tripped the watchdog).
+        if (g_stdout_is_tty) {
+            printf("  w=%.2f m=%.2f %s cd=%d\r",
+                   ema_wake, margin,
+                   schmitt_armed ? "ARM" : "off", cooldown);
+            fflush(stdout);
+        }
 
         // Decrement the post-resume settle counter every stride. While > 0,
         // suppress firing — the mel buffer still has stale pre-pause frames.
