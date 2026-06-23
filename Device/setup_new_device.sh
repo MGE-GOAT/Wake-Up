@@ -499,13 +499,19 @@ sudo systemctl enable elderly-camera.service elderly-pipeline.service \
                       noban-watchdog.timer
 ok "units installed + enabled"
 
-# Persistent journald — the default journal is volatile (RAM) and is wiped on
-# every reboot, which hides exactly the crash-loop logs we need to debug. Make
-# it persistent so `journalctl -b -1` survives across reboots.
+# Persistent journald — a volatile (RAM) journal is wiped on every reboot, which
+# hides exactly the crash-loop logs we need to debug. Force Storage=persistent
+# (an explicit Storage=volatile in journald.conf would override a bare mkdir) and
+# create the dir so `journalctl -b -1` survives across reboots.
 sudo mkdir -p /var/log/journal
+if grep -qiE '^[#[:space:]]*Storage=' /etc/systemd/journald.conf; then
+    sudo sed -i 's/^[#[:space:]]*Storage=.*/Storage=persistent/I' /etc/systemd/journald.conf
+else
+    echo 'Storage=persistent' | sudo tee -a /etc/systemd/journald.conf >/dev/null
+fi
 sudo systemd-tmpfiles --create --prefix /var/log/journal 2>/dev/null || true
-sudo systemctl kill -s USR1 systemd-journald 2>/dev/null || true
-ok "persistent journald enabled (/var/log/journal)"
+sudo systemctl restart systemd-journald 2>/dev/null || true
+ok "persistent journald enabled (Storage=persistent)"
 
 # =============================================================================
 # 6. POINT THE DEVICE AT THE SERVER
