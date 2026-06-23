@@ -8,6 +8,9 @@ After=elderly-pipeline.service
 User=pi
 WorkingDirectory=/home/pi/device_bundle/Noban
 Environment=OLED_STATE_FILE=/tmp/noban_oled_state
+# Vertical nudge (px, negative = up) — this OLED model renders a little low, so
+# shift the eyes up to centre them. Tune per panel if needed.
+Environment=OLED_EYE_DY=-6
 ExecStart=/usr/bin/python3 /home/pi/device_bundle/Noban/oled_eyes.py
 Restart=always
 RestartSec=5

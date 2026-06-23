@@ -1459,10 +1459,13 @@ LedColor recColor()  { return LedColor::GREEN; }
 // transition. States:
 //   "none"    blank screen — unprovisioned / BLE setup / factory reset / reboot
 //   "idle"    open eyes (provisioned, listening)
-//   "happy"   heard its name "Noban" (normal wake) — happy + focusing
-//   "listen"  woke from sleep on "Hey Noban" (guest) — awake + listening
+//   "excited" heard its name "Noban" (normal wake) — big sparkly eyes
+//   "happy"   warm closed-eye smile — used for greetings (greet / wakegreet)
+//   "listen"  woke from sleep on "Hey Noban" (guest) — curious scan
 //   "sleep"   guest/sleep mode (eyes closed)
 //   "worried" post-fall "speak now" recording
+//   "greet"     first-ever setup: daemon shows happy ~30s, then idle
+//   "wakegreet" guest→active: daemon shows idle 2s, happy 10s, then idle
 static void setOled(const char* state) {
     const char* f = std::getenv("OLED_STATE_FILE");
     std::string path = f ? f : "/tmp/noban_oled_state";
@@ -1474,6 +1477,32 @@ static void setOled(const char* state) {
         std::rename(tmp.c_str(), path.c_str());   // atomic swap for the reader
     }
     std::cout << "[OLED] " << state << "\n";
+}
+
+// "First setup" greeting marker. The very first provisioned boot shows a 30s
+// happy greeting (the daemon resolves the "greet" meta-state); we drop a marker
+// so later boots start calm. Factory reset wipes the marker so a re-onboarded
+// device greets again. Tries /var/lib/elderly-care (setup chowns it to pi) then
+// ~/.config/elderly-care — the same two locations as id.txt.
+static std::string greetMarkerPath() {
+    return "/var/lib/elderly-care/.greeted";
+}
+static bool hasGreeted() {
+    if (std::ifstream("/var/lib/elderly-care/.greeted").good()) return true;
+    const char* home = std::getenv("HOME");
+    if (home && std::ifstream(std::string(home) + "/.config/elderly-care/.greeted").good())
+        return true;
+    return false;
+}
+static void markGreeted() {
+    const char* home = std::getenv("HOME");
+    for (const std::string& p : {std::string("/var/lib/elderly-care/.greeted"),
+                                 home ? std::string(home) + "/.config/elderly-care/.greeted"
+                                      : std::string()}) {
+        if (p.empty()) continue;
+        std::ofstream o(p, std::ios::trunc);
+        if (o) { o << "1\n"; return; }
+    }
 }
 
 // Blink the LED a colour on a background thread until destroyed. Used to show
@@ -1848,7 +1877,9 @@ static void doFactoryReset() {
     }
     std::cout << "[button] server confirmed purge — wiping id.txt + Wi-Fi, rebooting\n";
     std::system("rm -f /var/lib/elderly-care/id.txt "
-                "       ~/.config/elderly-care/id.txt 2>/dev/null");
+                "       ~/.config/elderly-care/id.txt "
+                "       /var/lib/elderly-care/.greeted "
+                "       ~/.config/elderly-care/.greeted 2>/dev/null");
     std::system("nmcli -t -f UUID,TYPE c show 2>/dev/null | awk -F: "
                 "  '$2==\"802-11-wireless\"{print $1}' "
                 "  | xargs -r -n1 sudo nmcli c delete 2>/dev/null");
@@ -2159,7 +2190,7 @@ void buttonThread(std::atomic<bool>& running) {
                 std::cout << "[guest] SLEEP — fall+camera paused; wake is double-gated (\"Hey\"+\"Noban\"); press once to wake\n";
                 break;
             case ButtonGesture::WAKE:
-                g_guest_mode.store(false); setLed(idleColor()); setOled("idle");
+                g_guest_mode.store(false); setLed(idleColor()); setOled("wakegreet");
                 std::cout << "[guest] WAKE — monitoring resumed\n";
                 break;
             case ButtonGesture::NONE: break;
@@ -2197,7 +2228,7 @@ void housekeepingThread(std::atomic<bool>& running, std::shared_ptr<ServerComman
                 g_guest_mode.store(true);  setLed(LedColor::RED); setOled("sleep");
                 std::cout << "[guest] SLEEP via app — fall+camera paused; wake double-gated (\"Hey\"+\"Noban\")\n";
             } else if (st.guest_cmd == 0 && g_guest_mode.load()) {
-                g_guest_mode.store(false); setLed(idleColor()); setOled("idle");
+                g_guest_mode.store(false); setLed(idleColor()); setOled("wakegreet");
                 std::cout << "[guest] WAKE via app — monitoring resumed\n";
             }
             if (st.image_req_id >= 0 && !g_guest_mode.load()) {  // no snapshots while asleep (privacy)
@@ -2804,7 +2835,10 @@ int main(int argc, char** argv) {
 
     std::cout<<"\n✅ All models loaded. Starting pipeline.\n";
     setLed(idleColor());   // BLUE = idle/listening (RED in guest)
-    setOled(g_guest_mode.load() ? "sleep" : "idle");
+    // First-ever provisioned boot greets (daemon shows happy ~30s); later boots
+    // start calm. markGreeted() drops a marker so it only happens once.
+    if (!hasGreeted()) { setOled("greet"); markGreeted(); }
+    else               { setOled(g_guest_mode.load() ? "sleep" : "idle"); }
 
     // Open ALSA capture handle right here in main. WUW inference runs in this
     // same thread; the 300ms blocking read paces everything. Saves one
@@ -3048,7 +3082,7 @@ int main(int argc, char** argv) {
             // it hears its name normally; in guest it just woke from sleep on
             // "Hey Noban" so it's "listen"ing.
             setLed(recColor());
-            setOled(g_guest_mode.load() ? "listen" : "happy");
+            setOled(g_guest_mode.load() ? "listen" : "excited");
             // T1 keeps owning micleft and filling the ring; recordCommand reads
             // the post-wake audio straight from it — no mic open/close churn.
             playAlarm();
