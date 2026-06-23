@@ -86,8 +86,9 @@ SYSTEMD_SRC="${SRC_DIR}/systemd"
 ORT_VERSION="1.17.3"
 TFLITE_BRANCH="r2.13"
 
-say() { echo -e "\n\033[1;36m=== $* ===\033[0m"; }
-ok()  { echo -e "    \033[1;32m✓\033[0m $*"; }
+say()  { echo -e "\n\033[1;36m=== $* ===\033[0m"; }
+ok()   { echo -e "    \033[1;32m✓\033[0m $*"; }
+warn() { echo -e "    \033[1;33m⚠\033[0m $*" >&2; }
 
 say "Noban device provisioning — server=${SERVER_URL} mqtt=${MQTT_HOST}:${MQTT_PORT} bundle=${NOBAN_DIR}"
 
@@ -300,6 +301,34 @@ ok "source staged"
 cd "$NOBAN_DIR"
 mkdir -p deps models
 
+# ── Network hardening for the source clones below ────────────────────────────
+# Large clones (esp. tensorflow) over a restricted/proxied link (e.g. an Iran
+# proxy) can die mid-transfer with "GnuTLS recv error / early EOF". Tune git to
+# survive flaky links — HTTP/1.1 (proxies mangle HTTP/2 multiplexing), a big
+# transfer buffer, no compression, and a stall timeout. Applies to direct clones
+# AND the cmake FetchContent clones (XNNPACK/cpuinfo/etc.) during the TFLite build.
+git config --global http.version HTTP/1.1   2>/dev/null || true
+git config --global http.postBuffer 524288000 2>/dev/null || true
+git config --global core.compression 0      2>/dev/null || true
+git config --global http.lowSpeedLimit 1000  2>/dev/null || true
+git config --global http.lowSpeedTime 60     2>/dev/null || true
+
+# Clone with retries + clean slate each attempt (a partial clone left behind
+# would make a later `[ -d ]` check wrongly skip it). Usage: clone_retry <dir> <git clone args...>
+clone_retry() {
+    local dest="$1"; shift
+    [ -d "$dest" ] && return 0
+    local attempt
+    for attempt in 1 2 3 4 5; do
+        rm -rf "$dest"
+        if git "$@" "$dest"; then return 0; fi
+        warn "clone of $dest failed (attempt ${attempt}/5) — retrying in ${attempt}0s"
+        sleep "${attempt}0"
+    done
+    rm -rf "$dest"
+    return 1
+}
+
 # ── 3a. RNNoise (from setup.sh) ──────────────────────────────────────────────
 # NOTE: setup.log shows the rnnoise autogen tries to wget a model from
 # media.xiph.org and FAILS behind a restricted network. autogen.sh fetches the
@@ -364,9 +393,10 @@ fi
 #       deps/tensorflow-src/tflite_build and deps/tflite.
 say "[3d] build TFLite ${TFLITE_BRANCH} (this is the long one)"
 if [ ! -f deps/tflite/lib/libtensorflow-lite.a ]; then
-    [ -d deps/tensorflow-src ] || \
-        git clone --depth 1 -b "$TFLITE_BRANCH" \
-            https://github.com/tensorflow/tensorflow deps/tensorflow-src
+    # tensorflow is the big, network-fragile clone — retry with clean slate.
+    clone_retry deps/tensorflow-src clone --depth 1 -b "$TFLITE_BRANCH" \
+        https://github.com/tensorflow/tensorflow \
+      || { warn "tensorflow clone failed after retries — check the network/proxy and re-run (idempotent)"; exit 1; }
 
     # GCC 13+ dropped the transitive <cstdint>; r2.13 spectrogram.cc needs it.
     SPECTROGRAM="deps/tensorflow-src/tensorflow/lite/kernels/internal/spectrogram.cc"
