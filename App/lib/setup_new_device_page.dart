@@ -66,17 +66,11 @@ class _SetupNewDevicePageState extends State<SetupNewDevicePage> {
     _passwordController.text = _generateStrongPassword();
     _bleStatusSub = _ble.status.stream.listen((s) {
       if (!mounted) return;
+      // Just mirror the status for display. The Wi-Fi step (now last) owns its
+      // own wifi_ok/wifi_fail handling in _submitWifi, because the BLE link
+      // often drops as Wi-Fi comes up (shared chip) and 'wifi_ok' may never
+      // arrive — _submitWifi treats a dropped link after join as success.
       setState(() => _bleStatus = s);
-      // Advance from "join wifi" step once we see wifi_ok. Critically, clear
-      // _busy here: _submitWifi set it true and waits on this async status
-      // event to advance — without clearing it, step 3's Confirm button stays
-      // disabled/spinning forever (the "stuck after network login" bug).
-      if (s == 'wifi_ok' && _step == 2) {
-        setState(() { _step = 3; _busy = false; _error = null; });
-      } else if (s.startsWith('wifi_fail') && _step == 2) {
-        // Surface the failure and re-enable the Wi-Fi form to retry.
-        setState(() { _busy = false; _error = "اتصال Wi-Fi ناموفق: ${s.substring(s.indexOf(':') + 1).trim()}"; });
-      }
     });
   }
 
@@ -147,7 +141,12 @@ class _SetupNewDevicePageState extends State<SetupNewDevicePage> {
     }
   }
 
-  // ── Step 2 (action): submit Wi-Fi creds ────────────────────────────────
+  // ── Step 3 (action, LAST): submit Wi-Fi creds + finish ─────────────────
+  // The id/pass are already committed on the device and registered on the
+  // server. This is the final BLE write — and Wi-Fi + BLE share the Pi's chip,
+  // so the link usually drops the instant Wi-Fi comes up and we may never get
+  // 'wifi_ok'. So: send the join, wait briefly for an explicit result, and on a
+  // timeout / dropped link treat it as success (the device has the creds).
   Future<void> _submitWifi() async {
     if (_selectedSsid == null) {
       setState(() => _error = "یک شبکه انتخاب کنید");
@@ -160,14 +159,41 @@ class _SetupNewDevicePageState extends State<SetupNewDevicePage> {
       return;
     }
     setState(() { _busy = true; _error = null; });
+
+    final wifiResult = Completer<bool>();   // true=ok, false=explicit fail
+    StreamSubscription? sub;
+    sub = _ble.status.stream.listen((s) {
+      if (s == 'wifi_ok' && !wifiResult.isCompleted) {
+        wifiResult.complete(true);
+      } else if (s.startsWith('wifi_fail') && !wifiResult.isCompleted) {
+        wifiResult.complete(false);
+      }
+    });
+
+    bool ok;
     try {
       await _ble.joinWifi(_selectedSsid!, pw);
-      // Step 2 → Step 3 transition happens automatically when status stream
-      // emits "wifi_ok" (see initState listener). If it emits "wifi_fail",
-      // we surface it as an error.
-    } catch (e) {
-      setState(() { _busy = false; _error = "خطا: $e"; });
+    } catch (_) {
+      // Write threw as Wi-Fi came up — the device still received the join.
     }
+    try {
+      ok = await wifiResult.future.timeout(const Duration(seconds: 12));
+    } on TimeoutException {
+      ok = true;   // BLE dropped after a successful join (expected) — done
+    } finally {
+      await sub.cancel();
+    }
+
+    if (!mounted) return;
+    if (!ok) {
+      setState(() {
+        _busy = false;
+        _error = "اتصال Wi-Fi ناموفق — رمز را بررسی و دوباره تلاش کنید";
+      });
+      return;
+    }
+    try { await _ble.disconnect(); } catch (_) {}
+    setState(() { _busy = false; _step = 4; });
   }
 
   // ── Step 3: commit id+password → BLE + server ──────────────────────────
@@ -234,8 +260,9 @@ class _SetupNewDevicePageState extends State<SetupNewDevicePage> {
         // look like it was editing the id).
         await insertDevice(id, pw, name);
         await DeviceSecretStore.save(id, pw);
-        await _ble.disconnect();
-        setState(() { _busy = false; _step = 4; });
+        // Keep the BLE link OPEN — Wi-Fi join is the next (last) step. Identity
+        // is now committed on the device + registered on the server.
+        setState(() { _busy = false; _step = 3; });
       case ApiError(error: final e, status: final s):
         setState(() {
           _busy = false;
@@ -270,8 +297,12 @@ class _SetupNewDevicePageState extends State<SetupNewDevicePage> {
     switch (_step) {
       case 0: return _step0Instructions();
       case 1: return _step1Connect();
-      case 2: return _step2WifiPicker();
-      case 3: return _step3Credentials();
+      // Reordered: id/pass commit FIRST (step 2), Wi-Fi join LAST (step 3).
+      // Wi-Fi + BLE share the Pi's BCM4345C0 chip, so bringing Wi-Fi up drops
+      // the BLE link — doing the commit first keeps the link stable for it, and
+      // the (now-last) Wi-Fi join tolerates the drop.
+      case 2: return _step3Credentials();   // step 2 = credentials
+      case 3: return _step2WifiPicker();     // step 3 = Wi-Fi
       case 4: return _step4Success();
     }
     return const SizedBox();
@@ -437,7 +468,7 @@ class _SetupNewDevicePageState extends State<SetupNewDevicePage> {
           child: _busy
               ? const SizedBox(width: 22, height: 22,
                   child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
-              : const Text("اتصال به Wi-Fi",
+              : const Text("اتصال به Wi-Fi و پایان",
                   style: TextStyle(color: Colors.white, fontSize: 16)),
         ),
       ],
@@ -451,7 +482,7 @@ class _SetupNewDevicePageState extends State<SetupNewDevicePage> {
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           const Text(
-            "دستگاه به Wi-Fi متصل شد ✓\nحالا شناسه و رمز انتخابی خود را وارد کنید.",
+            "ابتدا شناسه و رمز دلخواه دستگاه را وارد کنید.\n(اتصال Wi-Fi در مرحله بعد انجام می‌شود.)",
             style: TextStyle(color: Colors.white, fontSize: 14),
           ),
           const SizedBox(height: 16),
@@ -511,7 +542,7 @@ class _SetupNewDevicePageState extends State<SetupNewDevicePage> {
             child: _busy
                 ? const SizedBox(width: 22, height: 22,
                     child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
-                : const Text("ثبت دستگاه",
+                : const Text("ثبت و ادامه",
                     style: TextStyle(color: Colors.white, fontSize: 18,
                         fontWeight: FontWeight.bold)),
           ),

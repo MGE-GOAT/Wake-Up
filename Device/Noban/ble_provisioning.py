@@ -117,7 +117,23 @@ _status_value = b"idle"
 _done_value   = b""
 _client_connected = False
 _setup_completed  = False
+# Setup finishes only after BOTH the identity is committed AND Wi-Fi has joined,
+# in EITHER order. The recommended app flow commits id/pass FIRST (BLE stable),
+# then joins Wi-Fi LAST — because Wi-Fi + BLE share the Pi's BCM4345C0 chip, so
+# bringing Wi-Fi up drops the BLE link; doing it last means the (now-lost) link
+# is no longer needed. Tracking both flags keeps the device tolerant of either
+# order, so an older app (Wi-Fi-first) still completes.
+_id_committed = False
+_wifi_done    = False
 _loop: Optional[asyncio.AbstractEventLoop] = None
+
+
+def _maybe_finalize() -> None:
+    """Finish setup once identity + Wi-Fi are both done (order-independent)."""
+    global _setup_completed
+    if _id_committed and _wifi_done and not _setup_completed:
+        log.info("id committed + wifi joined — finalizing setup")
+        _setup_completed = True
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
@@ -287,9 +303,11 @@ def _notify_status(value: bytes) -> None:
 
 
 def _notify_done(value: bytes) -> None:
-    global _done_value, _setup_completed
+    # NOTE: does NOT finalize setup — finalize happens only when id + wifi are
+    # both done (_maybe_finalize), so the app can commit id/pass first and join
+    # Wi-Fi last without the BLE-drop killing the flow.
+    global _done_value
     _done_value = value
-    _setup_completed = True
     log.info("done → %s", value.decode("utf-8", errors="replace"))
     try:
         _server.get_characteristic(CHAR_DONE).value = bytearray(value)
@@ -314,7 +332,10 @@ async def _handle_wifi_join(payload: bytes) -> None:
         None, _join_wifi, ssid, psk
     )
     if ok:
+        global _wifi_done
+        _wifi_done = True
         _notify_status(b"wifi_ok")
+        _maybe_finalize()   # if id already committed, finish (Wi-Fi is last)
     else:
         _notify_status(("wifi_fail: " + err).encode("utf-8")[:200])
 
@@ -336,7 +357,12 @@ async def _handle_commit(payload: bytes) -> None:
     ok, err = await asyncio.get_running_loop().run_in_executor(
         None, _persist_id_txt, device_id, password
     )
+    if ok:
+        global _id_committed
+        _id_committed = True
     _notify_done(b"ok" if ok else ("err: " + err).encode("utf-8")[:200])
+    if ok:
+        _maybe_finalize()   # if Wi-Fi already joined, finish
 
 
 def _on_write(char: BlessGATTCharacteristic, value: bytearray, **kwargs) -> None:
@@ -395,8 +421,9 @@ async def main() -> int:
         await _server.stop()
         return 1
 
-    # Window B — stay alive until commit completes (or signal).
-    log.info("client attached; waiting for commit_setup")
+    # Window B — stay alive until BOTH id commit + Wi-Fi join are done (in any
+    # order), or a signal. No timeout: the user may retry a wrong Wi-Fi password.
+    log.info("client attached; waiting for id commit + wifi join")
     while not _setup_completed:
         await asyncio.sleep(1)
 
