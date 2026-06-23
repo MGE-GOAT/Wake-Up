@@ -859,15 +859,16 @@ void _showEditNameDialog(BuildContext context, Map<String, dynamic> device,
             child: Text('ذخیره'),
             onPressed: () async {
               final newName = _controller.text.trim();
-              if (newName.isNotEmpty) {
-                await updateDeviceName(device['device_id'], newName);
-                // Update the in-memory map so the card reflects the new name
-                // immediately, then ask the parent to rebuild. markNeedsBuild
-                // on the dialog context (the old code) did nothing useful.
-                device['device_name'] = newName;
-                Navigator.of(context).pop();
-                if (onSaved != null) onSaved();
-              }
+              if (newName.isEmpty) return;
+              await updateDeviceName(device['device_id'], newName); // DB = truth
+              // Reflect immediately in the card's map. Guard it: sqflite query
+              // rows are READ-ONLY ('Unsupported operation: read-only'), and an
+              // unhandled throw here aborted the close + left the dialog in a bad
+              // state (the rename crash). The parent reload (onSaved) shows the
+              // new name regardless.
+              try { device['device_name'] = newName; } catch (_) {}
+              if (context.mounted) Navigator.of(context).pop();
+              if (onSaved != null) onSaved();
             },
           ),
         ],
