@@ -1880,10 +1880,18 @@ static void doFactoryReset() {
         return;
     }
     std::cout << "[button] server confirmed purge — wiping id.txt + Wi-Fi, rebooting\n";
-    std::system("rm -f /var/lib/elderly-care/id.txt "
-                "       ~/.config/elderly-care/id.txt "
-                "       /var/lib/elderly-care/.greeted "
-                "       ~/.config/elderly-care/.greeted 2>/dev/null");
+    // Use sudo for the /var/lib paths: deleting a file needs write permission on
+    // its DIRECTORY, and on some installs /var/lib/elderly-care is root-owned —
+    // a plain rm (we run as pi) then fails silently and the device reboots STILL
+    // provisioned but orphaned server-side. (pi has passwordless sudo on Pi OS.)
+    std::system("sudo rm -f /var/lib/elderly-care/id.txt /var/lib/elderly-care/.greeted 2>/dev/null; "
+                "rm -f ~/.config/elderly-care/id.txt ~/.config/elderly-care/.greeted 2>/dev/null");
+    // Hard guarantee: if id.txt somehow survived, truncate it to empty so
+    // loadDeviceIdentity() treats the device as UNPROVISIONED (never orphaned).
+    if (std::ifstream("/var/lib/elderly-care/id.txt").good()) {
+        std::cerr << "[button] WARNING: id.txt survived rm — truncating to force unprovisioned\n";
+        std::system("sudo sh -c ': > /var/lib/elderly-care/id.txt' 2>/dev/null");
+    }
     std::system("nmcli -t -f UUID,TYPE c show 2>/dev/null | awk -F: "
                 "  '$2==\"802-11-wireless\"{print $1}' "
                 "  | xargs -r -n1 sudo nmcli c delete 2>/dev/null");

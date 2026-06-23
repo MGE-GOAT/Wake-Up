@@ -568,15 +568,22 @@ EOF
 sudo systemctl daemon-reload
 ok "server/MQTT env written via drop-ins"
 
-# ── Device identity (optional) ───────────────────────────────────────────────
+# ── Device identity directory + (optional) identity file ─────────────────────
+# The pipeline runs as the `pi` user and must CREATE, READ, and DELETE id.txt:
+# BLE/app onboarding writes it, factory reset removes it. Deleting a file needs
+# write permission on the DIRECTORY (not the file), so the dir ITSELF must be
+# pi-owned — chowning only the file (as before) left the dir root-owned, which is
+# exactly why factory reset's `rm` silently failed and the device stayed
+# provisioned-but-orphaned. Make the dir pi-owned unconditionally.
+sudo mkdir -p /var/lib/elderly-care
+sudo chown pi:pi /var/lib/elderly-care
+sudo chmod 755 /var/lib/elderly-care
+
 # Written only if DEVICE_ID + DEVICE_PASSWORD given; otherwise the device boots
 # UNPROVISIONED and waits for BLE/app onboarding to write this file.
 if [ -n "$DEVICE_ID" ] && [ -n "$DEVICE_PASSWORD" ]; then
-    sudo mkdir -p /var/lib/elderly-care
-    printf '%s\n%s\n' "$DEVICE_ID" "$DEVICE_PASSWORD" \
-        | sudo tee /var/lib/elderly-care/id.txt >/dev/null
-    sudo chmod 600 /var/lib/elderly-care/id.txt
-    sudo chown pi:pi /var/lib/elderly-care/id.txt
+    printf '%s\n%s\n' "$DEVICE_ID" "$DEVICE_PASSWORD" > /var/lib/elderly-care/id.txt
+    chmod 600 /var/lib/elderly-care/id.txt
     ok "wrote /var/lib/elderly-care/id.txt (device_id=${DEVICE_ID})"
 else
     echo "    note: no DEVICE_ID/DEVICE_PASSWORD — device boots UNPROVISIONED (BLE/app onboarding)"
