@@ -289,6 +289,23 @@ class _MainPageState extends State<MainPage> {
                         ),
                       );
                     },
+                    onRemoved: () {
+                      if (!mounted) return;
+                      // Don't rebuild the device list while a dialog or pushed
+                      // page is on top — disposing cards mid-dialog throws
+                      // Flutter's '_dependents.isEmpty' assertion. The device is
+                      // already deleted locally; skip the UI refresh now and let
+                      // the next 15s poll (once we're back on this page, with no
+                      // modal up) drop the card cleanly.
+                      if (!(ModalRoute.of(context)?.isCurrent ?? true)) return;
+                      final label = (device['device_name']?.toString().isNotEmpty ?? false)
+                          ? device['device_name'].toString()
+                          : device['device_id'].toString();
+                      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+                        content: Text("دستگاه «$label» حذف شد (ریست یا لغو دسترسی)"),
+                      ));
+                      _loadDevices();
+                    },
                   );
                 },
               ),
@@ -319,11 +336,15 @@ class _MainPageState extends State<MainPage> {
 class DeviceCard extends StatefulWidget {
   final Map<String, dynamic> device;
   final VoidCallback onTap;
+  // Called when the server reports we no longer have access to this device
+  // (factory-reset purge or our subscription was removed) → parent drops it.
+  final VoidCallback? onRemoved;
 
   const DeviceCard({
     Key? key,
     required this.device,
     required this.onTap,
+    this.onRemoved,
   }) : super(key: key);
 
   @override
@@ -391,6 +412,21 @@ class _DeviceCardState extends State<DeviceCard> {
             body: jsonEncode({'device_id': widget.device['device_id']}),
           )
           .timeout(const Duration(seconds: 10));
+      // Auto-cleanup: the server deletes the device + all subscriptions on a
+      // factory-reset purge (and on caregiver removal), so it then reports
+      // not_subscribed (403). That is the definitive "remove this device" flag
+      // forwarded to the phone — distinct from a transient offline (which is a
+      // 200 with online:false) and from bad creds (403 "Invalid …"). Drop it.
+      if (r.statusCode == 403) {
+        try {
+          final b = jsonDecode(r.body);
+          if (b is Map && b['error'] == 'not_subscribed') {
+            await deleteDevice(widget.device['device_id'].toString());
+            if (mounted) widget.onRemoved?.call();
+            return;
+          }
+        } catch (_) {/* non-JSON 403 — leave as-is */}
+      }
       if (!mounted || r.statusCode != 200) return;
       final body = jsonDecode(r.body);
       final pillPending = body['pending'] == true;
