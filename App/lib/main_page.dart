@@ -280,6 +280,13 @@ class _MainPageState extends State<MainPage> {
                 itemBuilder: (context, index) {
                   final device = devices[index];
                   return DeviceCard(
+                    // Stable identity: without a key, an async DeviceStream/MQTT
+                    // rebuild swaps in new device maps and ListView.builder
+                    // DISPOSES the card — if a dialog (rename) opened from this
+                    // card's context is up, its inherited deps unmount and throw
+                    // '_dependents.isEmpty'. A ValueKey makes the element update
+                    // in place instead of being recreated.
+                    key: ValueKey(device['device_id']),
                     device: device,
                     onTap: () {
                       Navigator.push(
@@ -829,6 +836,10 @@ void _showEditNameDialog(BuildContext context, Map<String, dynamic> device,
 
   showDialog(
     context: context,
+    // Anchor on the ROOT navigator so the dialog's element lifetime is not tied
+    // to the (disposable) card context — prevents '_dependents.isEmpty' if the
+    // card is rebuilt/disposed by an async list refresh while the dialog is up.
+    useRootNavigator: true,
     // Dispose the controller once the dialog route is gone (was leaking one
     // controller per open).
     builder: (context) {
@@ -867,8 +878,14 @@ void _showEditNameDialog(BuildContext context, Map<String, dynamic> device,
               // state (the rename crash). The parent reload (onSaved) shows the
               // new name regardless.
               try { device['device_name'] = newName; } catch (_) {}
-              if (context.mounted) Navigator.of(context).pop();
-              if (onSaved != null) onSaved();
+              if (!context.mounted) return;
+              Navigator.of(context).pop();
+              // Defer the parent refresh to the NEXT frame — running setState
+              // synchronously right after pop() rebuilds while the dialog route
+              // is still mid-unmount, which trips '_dependents.isEmpty'.
+              if (onSaved != null) {
+                WidgetsBinding.instance.addPostFrameCallback((_) => onSaved());
+              }
             },
           ),
         ],
