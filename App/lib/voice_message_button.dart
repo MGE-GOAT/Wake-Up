@@ -78,7 +78,19 @@ class _VoiceMessageButtonState extends State<VoiceMessageButton> {
     if (!_recording) return;
     _timer?.cancel();
     String? path;
-    try { path = await _rec.stop(); } catch (_) {}
+    try {
+      path = await _rec.stop();
+    } catch (e) {
+      // A real recorder failure is distinct from a quick tap — tell the user
+      // instead of silently dropping it (was indistinguishable from no-op).
+      print('[voice] recorder stop failed: $e');
+      if (!mounted) return;
+      setState(() => _recording = false);
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('ضبط پیام صوتی ناموفق بود')),
+      );
+      return;
+    }
     if (!mounted) return;
     // Accidental quick tap (<0.6 s) → discard, don't show the send prompt.
     if (path == null || _elapsed.inMilliseconds < 600) {

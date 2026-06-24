@@ -61,13 +61,52 @@ void main() async {
     print('SharedPreferences read failed (continuing): $e');
   }
 
+  bool dbOk = true;
   try {
     await initializeDatabase();
   } catch (e) {
+    dbOk = false;
     print('initializeDatabase failed: $e');
   }
 
+  // If the DB never opened, `late Database database` is unassigned and the first
+  // getDevices() would throw LateInitializationError deep in the UI. Show a
+  // clear recoverable error screen instead of crashing.
+  if (!dbOk) {
+    runApp(const _StartupErrorApp());
+    return;
+  }
+
   runApp(MyApp(isLoggedIn: isLoggedIn));
+}
+
+class _StartupErrorApp extends StatelessWidget {
+  const _StartupErrorApp();
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      debugShowCheckedModeBanner: false,
+      locale: const Locale('fa', 'IR'),
+      home: const Directionality(
+        textDirection: TextDirection.rtl,
+        child: Scaffold(
+          backgroundColor: Color(0xFF37474F),
+          body: Center(
+            child: Padding(
+              padding: EdgeInsets.all(24),
+              child: Text(
+                'خطا در راه‌اندازی برنامه. لطفاً برنامه را ببندید و دوباره باز کنید. '
+                'اگر مشکل ادامه داشت، برنامه را حذف و دوباره نصب کنید.',
+                textAlign: TextAlign.center,
+                style: TextStyle(color: Colors.white, fontSize: 18),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
 }
 
 

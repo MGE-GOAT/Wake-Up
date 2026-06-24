@@ -159,7 +159,8 @@ class MqttService {
       Map<String, dynamic> body;
       try {
         body = jsonDecode(raw) as Map<String, dynamic>;
-      } catch (_) {
+      } catch (e) {
+        print('[mqtt] non-JSON payload on $topic (treating as raw): $e');
         body = {'raw': raw};
       }
       _route(topic, body);
@@ -170,11 +171,18 @@ class MqttService {
     // ignore: avoid_print
     print('[mqtt] $topic ← ${body.length} fields');
     if (topic.endsWith('/event/fall')) {
+      // Guard against a malformed (e.g. non-JSON) payload: without an id we'd
+      // insert an event keyed "null". Just nudge the UI to re-fetch instead.
+      final mid = body['message_id'];
+      if (mid == null) {
+        NotificationStream().notify();
+        return;
+      }
       // Persist to the local DB (ifAbsent → don't clobber the heartbeat's richer
       // row) so DeviceDetailsPage, which renders from the DB, shows the fall
       // immediately instead of waiting for the next heartbeat poll.
       insertEvent(
-        body['message_id'].toString(),
+        mid.toString(),
         _deviceIdFromTopic(topic),
         '{}', '', '',
         (body['occur_time'] ?? '').toString(),
@@ -210,10 +218,14 @@ class MqttService {
     try {
       await deleteDevice(deviceId);
       await DeviceSecretStore.remove(deviceId);
-    } catch (_) {/* best-effort local cleanup */}
+    } catch (e) {
+      print('[mqtt] _handleDeviceRemoved local cleanup failed: $e');
+    }
     try {
       DeviceStream().addDevices(await getDevices());  // refresh the list UI
-    } catch (_) {}
+    } catch (e) {
+      print('[mqtt] _handleDeviceRemoved list refresh failed: $e');
+    }
     NotificationStream().notify();
   }
 

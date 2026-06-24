@@ -107,7 +107,8 @@ class _VoiceInboxTabState extends State<VoiceInboxTab> {
 
   Future<void> _markSeen(int id) async {
     if (_seen.contains(id)) return;
-    if (mounted) setState(() => _seen.add(id));
+    // Replace the set rather than mutating in place (immutable update).
+    if (mounted) setState(() => _seen = {..._seen, id});
     final prefs = await SharedPreferences.getInstance();
     await prefs.setStringList(
         _seenKey, _seen.map((e) => e.toString()).toList());
@@ -140,7 +141,11 @@ class _VoiceInboxTabState extends State<VoiceInboxTab> {
     if (!mounted) return;
     setState(() => _playingId = id);
     await _player.stop();
-    _completeSub ??= _player.onPlayerComplete.listen((_) {
+    // Re-create the completion subscription each play. With `??=` the first
+    // play's listener stayed live; a later completion event could fire its
+    // closure against a torn-down state (setState-after-dispose).
+    await _completeSub?.cancel();
+    _completeSub = _player.onPlayerComplete.listen((_) {
       if (mounted) setState(() => _playingId = null);
     });
     await _player.play(DeviceFileSource(path));

@@ -149,7 +149,10 @@ Future<String?> downloadFallVideo({
     final path = '${dir.path}/fall_${deviceId}_$messageId.mp4';
     await File(path).writeAsBytes(bytes);
     return path;
-  } catch (_) {
+  } catch (e) {
+    // Log — a decrypt/MAC failure here is security-relevant (tampered or
+    // wrong-key blob) and was previously invisible. Caller still gets null.
+    print('[media_crypto] downloadFallVideo failed ($deviceId/$messageId): $e');
     return null;
   }
 }

@@ -419,6 +419,7 @@ class _EventCardState extends State<EventCard> {
                   onPressed: () async {
                     await widget
                         .onMarkAsRead(widget.event['event_id'].toString());
+                    if (!mounted) return;
                     setState(() {
                       isUnread = false;
                     });
@@ -622,6 +623,7 @@ class _WakeUpWordCardState extends State<WakeUpWordCard> {
                   onPressed: () async {
                     await widget
                         .onMarkAsRead(widget.event['event_id'].toString());
+                    if (!mounted) return;
                     setState(() {
                       isUnread = false;
                     });

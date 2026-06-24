@@ -100,12 +100,16 @@ class _CallPageState extends State<CallPage> {
     // 4) Janus session + keepalive.
     final sess = await _send({'janus': 'create'});
     _sessionId = (sess['data']?['id'] as num?)?.toInt();
+    // _send returns {} on a 15s timeout; without this check the call silently
+    // proceeds with a null session and hangs on "در حال اتصال...".
+    if (_sessionId == null) { _fail('اتصال به سرور تماس برقرار نشد'); return; }
     _keepalive = Timer.periodic(const Duration(seconds: 25),
         (_) => _send({'janus': 'keepalive'}).catchError((_) => <String, dynamic>{}));
 
     // 5) Attach VideoRoom (publisher handle) + join as publisher.
     final att = await _send({'janus': 'attach', 'plugin': 'janus.plugin.videoroom'});
     _pubHandle = (att['data']?['id'] as num?)?.toInt();
+    if (_pubHandle == null) { _fail('اتصال به سرور تماس برقرار نشد'); return; }
     await _send({'janus': 'message', 'handle_id': _pubHandle,
       'body': {'request': 'join', 'room': _room, 'ptype': 'publisher', 'display': 'caregiver'}});
     _safeSet(() => _status = 'در حال اتصال...');
@@ -135,7 +139,16 @@ class _CallPageState extends State<CallPage> {
     });
   }
 
-  void _onWsMessage(dynamic raw) async {
+  // Sync wrapper: exceptions thrown inside an `async void` stream listener
+  // escape to the root zone and are silently dropped, leaving the call frozen on
+  // "در حال اتصال...". Route them to _fail so the user gets feedback and an exit.
+  void _onWsMessage(dynamic raw) {
+    _handleWsEvent(raw).catchError((e) {
+      if (mounted) _fail('خطای ارتباط تماس: $e');
+    });
+  }
+
+  Future<void> _handleWsEvent(dynamic raw) async {
     if (_closing) return;   // ignore late Janus events after hangup (avoids null _ws)
     final Map<String, dynamic> m;
     try { m = jsonDecode(raw as String) as Map<String, dynamic>; } catch (_) { return; }

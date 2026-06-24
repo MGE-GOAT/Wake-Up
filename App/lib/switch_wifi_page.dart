@@ -193,6 +193,11 @@ class _SwitchWifiPageState extends State<SwitchWifiPage> {
 
   // ── Commit the EXISTING identity (keeps id.txt creds → no re-register) ────
   Future<void> _commitExistingIdentity() async {
+    // Re-entrancy guard: some Android BLE stacks deliver 'wifi_ok' twice. Without
+    // this, a second call cancels the first's _bleDoneSub mid-await, so the first
+    // Completer never resolves → spurious 15s timeout error even though setup
+    // succeeded. _busy is set synchronously below, so the second event bails here.
+    if (_busy) return;
     final id = _deviceId, pw = _devicePw;
     if (id == null || pw == null) return;
     setState(() {

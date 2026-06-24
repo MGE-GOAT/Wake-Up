@@ -108,6 +108,7 @@ class _MainPageState extends State<MainPage> {
 
   Future<void> _loadUserData() async {
     final prefs = await SharedPreferences.getInstance();
+    if (!mounted) return;
     setState(() {
       username = prefs.getString('username') ?? 'نام کاربری نامعلوم';
     });
@@ -190,6 +191,10 @@ class _MainPageState extends State<MainPage> {
     // (and the old user's subscriptions would keep delivering).
     _heartbeatService.stopHeartbeat();
     await MqttService.instance.stop();
+    // Let any already-queued MQTT/heartbeat callbacks drain before deleting the
+    // DB, so a final in-flight message can't call getDevices() on a wiped
+    // database (or push the old user's devices into the next session).
+    await Future.delayed(const Duration(milliseconds: 50));
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove('username');
     await prefs.remove('password'); // legacy plaintext (pre-migration installs)
@@ -425,14 +430,23 @@ class _DeviceCardState extends State<DeviceCard> {
       // forwarded to the phone — distinct from a transient offline (which is a
       // 200 with online:false) and from bad creds (403 "Invalid …"). Drop it.
       if (r.statusCode == 403) {
+        bool notSubscribed = false;
         try {
           final b = jsonDecode(r.body);
-          if (b is Map && b['error'] == 'not_subscribed') {
-            await deleteDevice(widget.device['device_id'].toString());
-            if (mounted) widget.onRemoved?.call();
-            return;
-          }
+          notSubscribed = b is Map && b['error'] == 'not_subscribed';
         } catch (_) {/* non-JSON 403 — leave as-is */}
+        if (notSubscribed) {
+          // Best-effort local DB cleanup, but DON'T let a DB failure (e.g. a
+          // concurrent heartbeat write locking sqflite) keep a removed device on
+          // screen: log it and still fire onRemoved so the card disappears.
+          try {
+            await deleteDevice(widget.device['device_id'].toString());
+          } catch (e) {
+            print('[checkPill] deleteDevice failed (will still drop card): $e');
+          }
+          if (mounted) widget.onRemoved?.call();
+          return;
+        }
       }
       if (!mounted || r.statusCode != 200) return;
       final body = jsonDecode(r.body);
@@ -460,7 +474,11 @@ class _DeviceCardState extends State<DeviceCard> {
           _lastSeen = lastSeen;
         });
       }
-    } catch (_) {/* best-effort */} finally {
+    } catch (e) {
+      // Transient network/parse errors are expected on a 15s poll; log at debug
+      // level rather than silently dropping (so a persistent failure is visible).
+      print('[checkPill] poll error (transient): $e');
+    } finally {
       _checking = false;
     }
   }

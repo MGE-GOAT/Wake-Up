@@ -356,10 +356,45 @@ import 'dart:convert';
 import 'dart:math';
 
 
-class SetUpPage extends StatelessWidget {
+class SetUpPage extends StatefulWidget {
   final Map<String, dynamic> deviceInfo;
 
   const SetUpPage({super.key, required this.deviceInfo});
+
+  @override
+  State<SetUpPage> createState() => _SetUpPageState();
+}
+
+class _SetUpPageState extends State<SetUpPage> {
+  // Owned by State and disposed in dispose(). Previously these were built inside
+  // build() of a StatelessWidget, so every rebuild allocated new controllers,
+  // leaked the old ones' listeners, and wiped whatever the user had typed.
+  late final TextEditingController _idController;
+  late final TextEditingController ssidController;
+  late final TextEditingController passwordController;
+  late final TextEditingController deviceKeyController;
+
+  @override
+  void initState() {
+    super.initState();
+    _idController =
+        TextEditingController(text: widget.deviceInfo['id']?.toString() ?? '');
+    ssidController =
+        TextEditingController(text: widget.deviceInfo['wifi_ssid'] ?? '');
+    passwordController =
+        TextEditingController(text: widget.deviceInfo['wifi_password'] ?? '');
+    deviceKeyController =
+        TextEditingController(text: widget.deviceInfo['key'] ?? '');
+  }
+
+  @override
+  void dispose() {
+    _idController.dispose();
+    ssidController.dispose();
+    passwordController.dispose();
+    deviceKeyController.dispose();
+    super.dispose();
+  }
 
   String generateRandomKey() {
     const chars = '123456789';
@@ -389,13 +424,6 @@ class SetUpPage extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final TextEditingController ssidController =
-        TextEditingController(text: deviceInfo['wifi_ssid'] ?? '');
-    final TextEditingController passwordController =
-        TextEditingController(text: deviceInfo['wifi_password'] ?? '');
-    final TextEditingController deviceKeyController =
-        TextEditingController(text: deviceInfo['key'] ?? '');
-
     return Scaffold(
       backgroundColor: const Color(0xFF37474F),
       appBar: AppBar(
@@ -423,7 +451,7 @@ class SetUpPage extends StatelessWidget {
               children: [
                 TextField(
                   style: const TextStyle(color: Colors.white),
-                  controller: TextEditingController(text: deviceInfo['id']),
+                  controller: _idController,
                   readOnly: true,
                   decoration: InputDecoration(
                     labelText: "Your Device ID:",
@@ -521,7 +549,7 @@ class SetUpPage extends StatelessWidget {
                         Uri.parse('$device_serverUrl/config_device'),
                         headers: {'Content-Type': 'application/json'},
                         body: jsonEncode({
-                          "id": deviceInfo['id'],
+                          "id": widget.deviceInfo['id'],
                           "key": deviceKeyController.text,
                           "setup_status": 1,
                           "wifi_password": passwordController.text,
@@ -529,6 +557,7 @@ class SetUpPage extends StatelessWidget {
                         }),
                       ).timeout(Duration(seconds: 100));
 
+                      if (!context.mounted) return;
                       if (response.statusCode == 200) {
                         showAlert(context, "تنظیمات با موفقیت ذخیره شد.");
                         Navigator.pop(context);

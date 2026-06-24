@@ -441,8 +441,13 @@ Future<void> updateEventStatusAsRead(String messageId) async {
 // paths (PII) to logcat in release builds.
 
 Future<List<Map<String, dynamic>>> getDevices() async {
-  final List<Map<String, dynamic>> devices = await database.query('devices');
-  return devices;
+  final rows = await database.query('devices');
+  // sqflite query rows are READ-ONLY. Return mutable copies so every consumer
+  // (DeviceStream subscribers, the urgency sort in _loadDevices, the rename
+  // path) can update fields in place without "Unsupported operation:
+  // read-only". Fixing it here covers all three addDevices() emit sites and any
+  // future consumer.
+  return rows.map((r) => Map<String, dynamic>.from(r)).toList();
 }
 
 
