@@ -2371,7 +2371,7 @@ void housekeepingThread(std::atomic<bool>& running, std::shared_ptr<ServerComman
                 for (int i = 0; i < 20 && !g_mic_free.load(); ++i)
                     std::this_thread::sleep_for(std::chrono::milliseconds(50));
                 std::this_thread::sleep_for(std::chrono::milliseconds(150)); // camera release
-                setLed(LedColor::BLUE);
+                setLed(LedColor::GREEN);   // GREEN for the duration of a call
                 std::string cmd =
                     std::string("DEVICE_ID='") + DEVICE_ID + "' " +
                     "KEY_HASH='" + KEY_HASH + "' " +
