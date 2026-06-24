@@ -827,69 +827,98 @@ class _DeviceCardState extends State<DeviceCard> {
 
 void _showEditNameDialog(BuildContext context, Map<String, dynamic> device,
     [VoidCallback? onSaved]) {
-  final deviceId = device['device_id']?.toString() ?? '';
-  final current = device['device_name']?.toString() ?? '';
-  // If the stored name is just the id (the old blank-name fallback), start
-  // empty so the user types a real display name instead of editing the id.
-  final TextEditingController _controller =
-      TextEditingController(text: current == deviceId ? '' : current);
-
   showDialog(
     context: context,
     // Anchor on the ROOT navigator so the dialog's element lifetime is not tied
-    // to the (disposable) card context — prevents '_dependents.isEmpty' if the
-    // card is rebuilt/disposed by an async list refresh while the dialog is up.
+    // to the (disposable) card context.
     useRootNavigator: true,
-    // Dispose the controller once the dialog route is gone (was leaking one
-    // controller per open).
-    builder: (context) {
-      return AlertDialog(
-        title: Text('ویرایش نام دستگاه'),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            // Device ID is fixed (set at provisioning) — show it read-only so
-            // it's clear this dialog edits the friendly *name*, not the id.
-            Text('شناسه دستگاه: $deviceId',
-                style: const TextStyle(color: Colors.grey, fontSize: 13)),
-            const SizedBox(height: 12),
-            TextField(
-              controller: _controller,
-              decoration: const InputDecoration(
-                  labelText: 'نام نمایشی', hintText: 'مثلاً اتاق مادربزرگ'),
-            ),
-          ],
-        ),
-        actions: [
-          TextButton(
-            child: Text('لغو', style: TextStyle(color: Colors.grey)),
-            onPressed: () => Navigator.of(context).pop(),
-          ),
-          ElevatedButton(
-            child: Text('ذخیره'),
-            onPressed: () async {
-              final newName = _controller.text.trim();
-              if (newName.isEmpty) return;
-              await updateDeviceName(device['device_id'], newName); // DB = truth
-              // Reflect immediately in the card's map. Guard it: sqflite query
-              // rows are READ-ONLY ('Unsupported operation: read-only'), and an
-              // unhandled throw here aborted the close + left the dialog in a bad
-              // state (the rename crash). The parent reload (onSaved) shows the
-              // new name regardless.
-              try { device['device_name'] = newName; } catch (_) {}
-              if (!context.mounted) return;
-              Navigator.of(context).pop();
-              // Defer the parent refresh to the NEXT frame — running setState
-              // synchronously right after pop() rebuilds while the dialog route
-              // is still mid-unmount, which trips '_dependents.isEmpty'.
-              if (onSaved != null) {
-                WidgetsBinding.instance.addPostFrameCallback((_) => onSaved());
-              }
-            },
+    builder: (context) => _EditNameDialog(device: device, onSaved: onSaved),
+  );
+}
+
+/// Stateful so the [TextEditingController] is owned by a [State] and disposed in
+/// [State.dispose] — which Flutter only calls AFTER the dialog route has fully
+/// unmounted (exit transition complete). The previous version disposed the
+/// controller in `showDialog(...).then(...)`, which fires the instant pop()
+/// resolves while the fade-out is still rebuilding the TextField — re-attaching
+/// a listener to the just-disposed controller ("TextEditingController used after
+/// being disposed"), aborting the frame mid-rebuild and tripping the cascade
+/// assertion `_dependents.isEmpty`. Owning it in State fixes the lifetime.
+class _EditNameDialog extends StatefulWidget {
+  const _EditNameDialog({required this.device, this.onSaved});
+
+  final Map<String, dynamic> device;
+  final VoidCallback? onSaved;
+
+  @override
+  State<_EditNameDialog> createState() => _EditNameDialogState();
+}
+
+class _EditNameDialogState extends State<_EditNameDialog> {
+  late final TextEditingController _controller;
+  bool _saving = false;
+
+  @override
+  void initState() {
+    super.initState();
+    final deviceId = widget.device['device_id']?.toString() ?? '';
+    final current = widget.device['device_name']?.toString() ?? '';
+    // If the stored name is just the id (the old blank-name fallback), start
+    // empty so the user types a real display name instead of editing the id.
+    _controller =
+        TextEditingController(text: current == deviceId ? '' : current);
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  Future<void> _save() async {
+    final newName = _controller.text.trim();
+    if (newName.isEmpty) return;
+    setState(() => _saving = true);
+    // DB is the source of truth; updateDeviceName also pushes the refreshed list
+    // onto DeviceStream, so the card updates itself — no in-place map mutation
+    // (sqflite rows are read-only) and no manual parent refresh needed.
+    await updateDeviceName(widget.device['device_id'], newName);
+    if (!mounted) return;
+    Navigator.of(context).pop();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final deviceId = widget.device['device_id']?.toString() ?? '';
+    return AlertDialog(
+      title: const Text('ویرایش نام دستگاه'),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          // Device ID is fixed (set at provisioning) — show it read-only so
+          // it's clear this dialog edits the friendly *name*, not the id.
+          Text('شناسه دستگاه: $deviceId',
+              style: const TextStyle(color: Colors.grey, fontSize: 13)),
+          const SizedBox(height: 12),
+          TextField(
+            controller: _controller,
+            autofocus: true,
+            decoration: const InputDecoration(
+                labelText: 'نام نمایشی', hintText: 'مثلاً اتاق مادربزرگ'),
           ),
         ],
-      );
-    },
-  ).then((_) => _controller.dispose());
+      ),
+      actions: [
+        TextButton(
+          onPressed: _saving ? null : () => Navigator.of(context).pop(),
+          child: const Text('لغو', style: TextStyle(color: Colors.grey)),
+        ),
+        ElevatedButton(
+          onPressed: _saving ? null : _save,
+          child: const Text('ذخیره'),
+        ),
+      ],
+    );
+  }
 }

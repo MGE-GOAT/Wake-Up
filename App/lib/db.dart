@@ -297,6 +297,11 @@ Future<void> updateDeviceName(String deviceId, String newDeviceName) async {
     where: 'device_id = ?',
     whereArgs: [deviceId],
   );
+  // Notify listeners so the device list re-reads the new name from the DB
+  // (same pattern as deleteDevice). Without this, the rename persists to the DB
+  // but the visible card keeps showing the old name until the next reload.
+  final devices = await getDevices();
+  DeviceStream().addDevices(devices);
 }
 
 
