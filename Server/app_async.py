@@ -6,10 +6,10 @@ so the existing phone app + Pi pipeline talk to it unchanged.
 
 Architecture (single-box / one-GPU / ~200 users):
   • Single uvicorn process, async event loop handles all I/O-bound endpoints.
-  • Heavy /Wake_Command (Whisper STT + LLM) runs in a worker thread
-    (run_in_threadpool) gated by a GPU semaphore so concurrent wake commands
-    serialize on the card instead of OOMing it. faster-whisper + llama.cpp
-    release the GIL, so the event loop keeps serving other requests.
+  • Heavy /Wake_Command (Whisper STT + LLM) is offloaded to a separate GPU
+    worker process over a Redis job queue (_classify_via_queue → wake_worker.py),
+    which serializes inference on the card. The API process never loads the
+    models, so the event loop keeps serving other requests while a job runs.
   • WebRTC SDP/ICE mailbox + validation codes + image-req map are in-process
     dicts. Correct for one process; move to Redis if you ever scale to
     multiple workers / boxes.
@@ -72,6 +72,13 @@ PILL_AUDIO_DIR = os.path.join(UPLOAD_FOLDER, "pill_audio")
 VOICE_TO_DEVICE_DIR = os.path.join(UPLOAD_FOLDER, "voice_to_device")
 os.makedirs(VOICE_TO_DEVICE_DIR, exist_ok=True)
 _pending_voice = {}
+# Guards the get→swap of _pending_voice now that the file write is offloaded to a
+# thread (introduces an await between read and set).
+_pending_voice_lock = asyncio.Lock()
+# Hard cap on device→server media uploads. A forged device credential could
+# otherwise POST a multi-GB body and exhaust memory/disk (the body is read fully
+# before writing). Fall A/V clips are ~10 s; 25 MB is generous headroom.
+_MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", str(25 * 1024 * 1024)))
 
 def _safe_name(s: str) -> str:
     return "".join(c if c.isalnum() or c in "_-" else "_" for c in str(s))
@@ -131,8 +138,9 @@ async def _classify_via_queue(wav_path: str, timeout: int = 30):
     d = json.loads(res[1])
     return d.get("intent", "MESSAGE"), d.get("transcript", "")
 
-# GPU gate — serialize Whisper+LLM so concurrent wake commands don't OOM.
-_gpu_sema = asyncio.Semaphore(1)
+# NOTE: GPU serialization now lives in the wake worker (_GPU_LOCK in
+# wake_command.py / wake_worker.py), reached via _classify_via_queue. There is
+# deliberately no in-process GPU semaphore here — the API never runs inference.
 
 pool: asyncpg.Pool | None = None
 
@@ -268,11 +276,13 @@ async def _retention_loop():
                 ids = [r["id"] for r in stale]
                 await pool.execute(
                     "DELETE FROM unread_messages WHERE message_id = ANY($1::bigint[])", ids)
-                for r in stale:
-                    for p in (r["message_image"], r["message_video"]):
-                        if p and os.path.isfile(p):
-                            try: os.remove(p)
-                            except OSError: pass
+                # Offload the file deletions to a thread — a large sweep (hundreds
+                # of MP4s on a slow disk) would otherwise block the event loop and
+                # stall live requests / device heartbeats.
+                paths = [p for r in stale
+                         for p in (r["message_image"], r["message_video"])
+                         if p and os.path.isfile(p)]
+                await run_in_threadpool(_remove_files, paths)
                 print(f"[retention] pruned {len(ids)} messages "
                       f"(Event cap {keep_event}, other {keep_msg}/device, or >{days}d)")
             # Orphan unread rows whose message was already deleted elsewhere.
@@ -288,11 +298,13 @@ async def _retention_loop():
                         ) t WHERE t.rn > {keep_hist}
                     )""")
         except Exception as e:
-            print(f"[retention] loop error: {e}")
+            logging.error("[retention] loop error: %s", e, exc_info=True)
         await asyncio.sleep(3600)
 
 
-# ── SMTP (unchanged logic from myserver.py; runs in a thread) ───────────────
+# ── SMTP (runs in a thread; global PySocks proxy state guarded by _smtp_lock) ─
+_smtp_lock = threading.Lock()
+
 def send_validation_code_to_user_email(email, validation_code):
     SMTP_SERVER, SMTP_PORT = "smtp.gmail.com", 465
     SENDER_EMAIL = os.environ.get("SMTP_SENDER_EMAIL", "noorijustfortest1@gmail.com")
@@ -306,26 +318,30 @@ def send_validation_code_to_user_email(email, validation_code):
     proxy_host = os.environ.get("SMTP_PROXY_HOST")
     proxy_port = int(os.environ.get("SMTP_PROXY_PORT", "0"))
     proxy_type = os.environ.get("SMTP_PROXY_TYPE", "socks5").lower()
-    if proxy_host and proxy_port:
+    # socks.set_default_proxy + wrap_module mutate PROCESS-GLOBAL PySocks state.
+    # Two concurrent registrations would race (one clobbers the other's proxy
+    # mid-connect). Serialize the whole proxy-setup→connect→send under one lock.
+    with _smtp_lock:
+        if proxy_host and proxy_port:
+            try:
+                import socks
+                kind = socks.HTTP if proxy_type == "http" else socks.SOCKS5
+                socks.set_default_proxy(kind, proxy_host, proxy_port)
+                socks.wrap_module(smtplib)
+            except Exception as e:
+                print(f"[smtp] proxy setup failed ({e}) — direct")
+        smtp = None
         try:
-            import socks
-            kind = socks.HTTP if proxy_type == "http" else socks.SOCKS5
-            socks.set_default_proxy(kind, proxy_host, proxy_port)
-            socks.wrap_module(smtplib)
+            smtp = smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT, timeout=30)
+            smtp.login(SENDER_EMAIL, SENDER_PASSWORD)
+            smtp.sendmail(SENDER_EMAIL, email, msg.as_string())
+            print(f"[smtp] sent code {validation_code} to {email}", flush=True)
         except Exception as e:
-            print(f"[smtp] proxy setup failed ({e}) — direct")
-    smtp = None
-    try:
-        smtp = smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT, timeout=30)
-        smtp.login(SENDER_EMAIL, SENDER_PASSWORD)
-        smtp.sendmail(SENDER_EMAIL, email, msg.as_string())
-        print(f"[smtp] sent code {validation_code} to {email}", flush=True)
-    except Exception as e:
-        print(f"[smtp] FAILED to send to {email}: {type(e).__name__}: {e}", flush=True)
-    finally:
-        if smtp is not None:
-            try: smtp.quit()
-            except Exception: pass
+            print(f"[smtp] FAILED to send to {email}: {type(e).__name__}: {e}", flush=True)
+        finally:
+            if smtp is not None:
+                try: smtp.quit()
+                except Exception: pass
 
 
 _VALIDATION_TTL_SEC = 180
@@ -402,6 +418,16 @@ def _write_file(file_path, data):
     off the async event loop."""
     with open(file_path, "wb") as f:
         f.write(data)
+
+
+def _remove_files(paths):
+    """Blocking best-effort deletion of a list of files; call via
+    run_in_threadpool so a large sweep doesn't block the event loop."""
+    for p in paths:
+        try:
+            os.remove(p)
+        except OSError:
+            pass
 
 
 def read_file_as_base64(file_path):
@@ -740,10 +766,14 @@ async def message_device(request: Request):
     image_path = os.path.join(UPLOAD_FOLDER, f"{device_id}_{ts}_image.bin")
     video_path = os.path.join(UPLOAD_FOLDER, f"{device_id}_{ts}_video.bin")
     image_bytes = await message_image.read()
+    if len(image_bytes) > _MAX_UPLOAD_BYTES:
+        return err({"error": "image too large"}, 413)
     await run_in_threadpool(_write_file, image_path, image_bytes)
     has_video = message_video is not None and hasattr(message_video, "read")
     if has_video:
         video_bytes = await message_video.read()
+        if len(video_bytes) > _MAX_UPLOAD_BYTES:
+            return err({"error": "video too large"}, 413)
         await run_in_threadpool(_write_file, video_path, video_bytes)
 
     msg_id = await pool.fetchval(
@@ -781,44 +811,46 @@ async def message_device(request: Request):
 async def _fanout_subscribers(device_id, msg_id):
     """Insert msg into every subscriber's unread queue + fire FCM check."""
     subs = await pool.fetch("SELECT username FROM subscriptions WHERE device_id=$1", device_id)
+    # The message is the same for every subscriber — fetch + parse it ONCE
+    # (was re-fetched per subscriber) and build the notification once.
+    mrow = await pool.fetchrow("SELECT message_text FROM messages WHERE id=$1", msg_id)
+    try:
+        mt = json.loads(mrow["message_text"]) if mrow else {}
+    except Exception:
+        mt = {}
+    mtype = mt.get("Message Type", "_")
+    notify = None  # (title, body, color) — None if this type sends no push
+    if mtype == "Event":
+        lvl = mt.get("Danger Level", "Unknown")
+        dl = {0: "بدون خطر جدی", 1: "وضعیت نامشخص", 2: "خطر جدی"}.get(lvl, "")
+        color = {0: "#33FF00", 1: "#FFA500", 2: "#FF0000"}.get(lvl, "#33FF00")
+        # Samsung/One UI ignores the notification accent color, so encode
+        # severity as a colored emoji in the TITLE — visible on every device.
+        emoji = {0: "🟢", 1: "🟠", 2: "🔴"}.get(lvl, "⚪")
+        notify = (f"{emoji} هشدار سقوط", f"میزان خطر: {dl}", color)
+    elif mtype == "Wake up word":
+        title = mt.get("Event Title") or mt.get("Message Title") or "New Event"
+        notify = (title, mt.get("Message Text", ""), "#33FF00")
+
+    tokens = []
     for s in subs:
         await pool.execute(
             "INSERT INTO unread_messages (user_username, message_id) VALUES ($1,$2)",
             s["username"], msg_id)
-        urow = await pool.fetchrow(
-            "SELECT firebase_token FROM users WHERE username=$1", s["username"])
-        mrow = await pool.fetchrow("SELECT message_text FROM messages WHERE id=$1", msg_id)
-        if urow and urow["firebase_token"] and mrow:
-            try:
-                mt = json.loads(mrow["message_text"])
-            except Exception:
-                mt = {}
-            mtype = mt.get("Message Type", "_")
-            color = "#33FF00"
-            if mtype == "Event":
-                lvl = mt.get("Danger Level", "Unknown")
-                dl = {0: "بدون خطر جدی", 1: "وضعیت نامشخص", 2: "خطر جدی"}.get(lvl, "")
-                color = {0: "#33FF00", 1: "#FFA500", 2: "#FF0000"}.get(lvl, "#33FF00")
-                # Samsung/One UI ignores the notification accent color, so encode
-                # severity as a colored emoji in the TITLE — visible on every
-                # device. (color is still sent for OSes that do honor it.)
-                emoji = {0: "🟢", 1: "🟠", 2: "🔴"}.get(lvl, "⚪")
-                # Persian title (the device sends the English "Fall Detection").
-                title = f"{emoji} هشدار سقوط"
-                try:
-                    await run_in_threadpool(send_notification, urow["firebase_token"],
-                                            title,
-                                            f"میزان خطر: {dl}", color)
-                except Exception as ex:
-                    print(f"  FCM fail {s['username']}: {ex}")
-            elif mtype == "Wake up word":
-                title = mt.get("Event Title") or mt.get("Message Title") or "New Event"
-                try:
-                    await run_in_threadpool(send_notification, urow["firebase_token"],
-                                            title,
-                                            mt.get("Message Text", ""), color)
-                except Exception as ex:
-                    print(f"  FCM fail {s['username']}: {ex}")
+        if notify is not None:
+            urow = await pool.fetchrow(
+                "SELECT firebase_token FROM users WHERE username=$1", s["username"])
+            if urow and urow["firebase_token"]:
+                tokens.append(urow["firebase_token"])
+
+    # Fan out all FCM sends concurrently — was sequential (N subscribers × up to
+    # 5s each). send_notification swallows its own transport errors → None.
+    if notify is not None and tokens:
+        title, body, color = notify
+        await asyncio.gather(*[
+            run_in_threadpool(send_notification, t, title, body, color)
+            for t in tokens
+        ], return_exceptions=True)
 
 
 @app.post("/Voice_Message_Device")
@@ -832,8 +864,10 @@ async def voice_message_device(request: Request):
         return err({"error": "Missing audio file"}, 400)
     ts = datetime.now().strftime('%Y%m%d%H%M%S')
     audio_path = os.path.join(UPLOAD_FOLDER, f"{device_id}_{ts}_voice.m4a")
-    with open(audio_path, "wb") as f:
-        f.write(await audio.read())
+    audio_bytes = await audio.read()
+    if len(audio_bytes) > _MAX_UPLOAD_BYTES:
+        return err({"error": "audio too large"}, 413)
+    await run_in_threadpool(_write_file, audio_path, audio_bytes)
     occurred = _now_str()
     msg_id = await pool.fetchval(
         "INSERT INTO messages (device_id, message_type, message_text, message_image, "
@@ -917,7 +951,10 @@ async def login_app(request: Request):
     password = request.headers.get("Password")
     if not username or not password:
         return err({"error": "Username or Password missing"}, 400)
-    user = await pool.fetchrow("SELECT * FROM users WHERE username=$1", username)
+    # Select only the column we return — SELECT * also pulled the bcrypt hash and
+    # firebase_token into the response path. (_verify_user_password does its own
+    # password lookup.)
+    user = await pool.fetchrow("SELECT config_file FROM users WHERE username=$1", username)
     if user is None or not await _verify_user_password(username, password):
         return err({"error": "Invalid username or password"}, 403)
 
@@ -925,14 +962,19 @@ async def login_app(request: Request):
     device_data = {}
     for d in devices:
         device_id = d["device_id"]
+        # Bound the login payload: newest N fall Events per device (matches the
+        # retention cap). Without LIMIT a long-lived device returned every event
+        # ever (tens of MB of base64) and blocked the loop.
         messages = await pool.fetch(
-            "SELECT * FROM messages WHERE device_id=$1 AND message_type=$2", device_id, "Event")
+            "SELECT * FROM messages WHERE device_id=$1 AND message_type=$2 "
+            "ORDER BY id DESC LIMIT $3", device_id, "Event", _EVENT_KEEP_PER_DEVICE)
         device_data[device_id] = []
         for m in messages:
             device_data[device_id].append({
                 "device_id": m["device_id"], "message_id": m["id"],
                 "message_type": m["message_type"], "message_text": m["message_text"],
-                "message_image": read_file_as_base64(m["message_image"]),
+                "message_image": await run_in_threadpool(
+                    read_file_as_base64, m["message_image"]),
                 "has_video": bool(m["message_video"]),  # MP4 fetched on demand
                 "message_occur_time": str(m["message_occur_time"]),
             })
@@ -997,7 +1039,8 @@ async def message_check_app(request: Request):
         message_list.append({
             "device_id": m["device_id"], "message_id": m["message_id"],
             "message_type": m["message_type"], "message_text": m["message_text"],
-            "message_image": read_file_as_base64(m["message_image"]),
+            "message_image": await run_in_threadpool(
+                read_file_as_base64, m["message_image"]),
             "has_video": bool(m["message_video"]),
             "message_occur_time": str(m["message_occur_time"]),
         })
@@ -1074,10 +1117,10 @@ async def voice_messages_app(request: Request):
         device_id)
     out = []
     for r in rows:
-        path, b64 = r["message_video"], None
-        if path and os.path.isfile(path):
-            with open(path, "rb") as f:
-                b64 = base64.b64encode(f.read()).decode("ascii")
+        path = r["message_video"]
+        # Read + base64-encode off the event loop (was a synchronous read of the
+        # full audio per row, up to 50 rows, blocking all other requests).
+        b64 = await run_in_threadpool(read_file_as_base64, path) if path else None
         encrypted = False
         try:
             encrypted = json.loads(r["message_text"]).get("encrypted") is True
@@ -1110,8 +1153,8 @@ async def fall_video_app(request: Request):
         int(message_id) if str(message_id).isdigit() else -1, device_id)
     if row is None or not row["message_video"] or not os.path.isfile(row["message_video"]):
         return err({"error": "video not found"}, 404)
-    with open(row["message_video"], "rb") as f:
-        b64 = base64.b64encode(f.read()).decode("ascii")
+    # Read + encode the (multi-MB) MP4 off the event loop.
+    b64 = await run_in_threadpool(read_file_as_base64, row["message_video"])
     encrypted = False
     try:
         encrypted = json.loads(row["message_text"]).get("encrypted") is True
@@ -1152,10 +1195,14 @@ async def pill_sync_app(request: Request, text: str = Form(...),
     audio_path = ""
     if audio_file is not None:
         ts = datetime.now().strftime("%Y%m%d%H%M%S")
-        raw_path = os.path.join(PILL_AUDIO_DIR, f"{device_id}_{pill_id_local}_{ts}.raw")
-        wav_path = os.path.join(PILL_AUDIO_DIR, f"{device_id}_{pill_id_local}.wav")
-        with open(raw_path, "wb") as f:
-            f.write(await audio_file.read())
+        # Sanitize both components — they form a filesystem path; an unsanitized
+        # pill_id_local like "../../x" would escape PILL_AUDIO_DIR. The served
+        # path is the DB-stored audio_path, so this stays self-consistent.
+        safe_dev = _safe_name(device_id)
+        safe_pid = _safe_name(pill_id_local)
+        raw_path = os.path.join(PILL_AUDIO_DIR, f"{safe_dev}_{safe_pid}_{ts}.raw")
+        wav_path = os.path.join(PILL_AUDIO_DIR, f"{safe_dev}_{safe_pid}.wav")
+        await run_in_threadpool(_write_file, raw_path, await audio_file.read())
         # Pill reminders are played to the elderly user via aplay on the device
         # (MAX98357A I2S DAC, which runs 48 kHz natively — same as live calls).
         # This is human-heard audio, NOT an ML-pipeline input, so transcode at
@@ -1364,17 +1411,18 @@ async def voice_to_device(request: Request):
     # Unique filename per note so the device's one-shot delete (a background task
     # that runs after the response is sent) can never delete a *newer* note that
     # arrived in between. Drop any previous un-fetched note on overwrite.
-    old = _pending_voice.get(device_id)
     path = os.path.join(VOICE_TO_DEVICE_DIR,
                         f"{_safe_name(device_id)}_{int(time.time() * 1000)}.wav")
-    with open(path, "wb") as f:
-        f.write(data)
-    _pending_voice[device_id] = path
+    # Write the new (fully-formed) file off the event loop FIRST, then atomically
+    # swap the pending pointer under a lock. Ordering guarantees the pointer never
+    # references a half-written file, and the lock closes the get→set race the
+    # offloaded write would otherwise open. Finally drop the superseded note.
+    await run_in_threadpool(_write_file, path, data)
+    async with _pending_voice_lock:
+        old = _pending_voice.get(device_id)
+        _pending_voice[device_id] = path
     if old and old != path and os.path.exists(old):
-        try:
-            os.remove(old)
-        except OSError:
-            pass
+        await run_in_threadpool(_remove_files, [old])
     return {"message": "voice queued"}
 
 
@@ -1564,11 +1612,12 @@ async def wake_command_route(request: Request):
     wav_bytes = await request.body()
     if len(wav_bytes) < 64:
         return err({"error": "Audio body too small / missing"}, 400)
+    if len(wav_bytes) > _MAX_UPLOAD_BYTES:
+        return err({"error": "audio too large"}, 413)
     ts = datetime.now().strftime("%Y%m%d%H%M%S")
     occurred = _now_str()
     wav_path = os.path.join(UPLOAD_FOLDER, f"{device_id}_{ts}_wake.wav")
-    with open(wav_path, "wb") as f:
-        f.write(wav_bytes)
+    await run_in_threadpool(_write_file, wav_path, wav_bytes)
     # Enqueue to the GPU worker (wake_worker.py) and wait for the result. The API
     # holds no models now → it can run multiple workers + bursts queue instead of
     # serializing in-process. Scale = more workers / batched backend on the worker.
@@ -1828,15 +1877,24 @@ async def _purge_device(device_id: str) -> dict:
             counts["devices"] = _rowcount(await conn.execute(
                 "DELETE FROM devices WHERE device_id=$1", device_id))
 
-    for pat in (os.path.join(UPLOAD_FOLDER, f"{device_id}_*"),
-                os.path.join(PILL_AUDIO_DIR, f"{device_id}_*")):
-        file_paths.update(glob.glob(pat))
-    files_removed = 0
-    for p in file_paths:
-        try:
-            os.remove(p); files_removed += 1
-        except OSError:
-            pass
+    # Glob + delete on a thread — a device with many fall MP4s can have hundreds
+    # of files; doing this on the event loop would stall live requests/heartbeats
+    # (and this can fire from the MAC-dedup path on every heartbeat until done).
+    def _glob_and_remove(known, patterns):
+        paths = set(known)
+        for pat in patterns:
+            paths.update(glob.glob(pat))
+        n = 0
+        for p in paths:
+            try:
+                os.remove(p); n += 1
+            except OSError:
+                pass
+        return n
+    files_removed = await run_in_threadpool(
+        _glob_and_remove, file_paths,
+        [os.path.join(UPLOAD_FOLDER, f"{device_id}_*"),
+         os.path.join(PILL_AUDIO_DIR, f"{device_id}_*")])
 
     try: mqtt_pub.state_pill(device_id, [])
     except Exception: pass
@@ -1888,17 +1946,18 @@ async def fall_clip_replace_device(request: Request):
         device_id)
     if row is None:
         return err({"error": "no Event to replace"}, 404)
+    clip_bytes = await clip.read()
+    if len(clip_bytes) > _MAX_UPLOAD_BYTES:
+        return err({"error": "clip too large"}, 413)
     ts = datetime.now().strftime("%Y%m%d%H%M%S")
     new_path = os.path.join(UPLOAD_FOLDER, f"{device_id}_{ts}_avclip.bin")
-    with open(new_path, "wb") as f:
-        f.write(await clip.read())
+    await run_in_threadpool(_write_file, new_path, clip_bytes)
     old = row["message_video"]
     await pool.execute("UPDATE messages SET message_video=$1 WHERE id=$2",
                        new_path, row["id"])
     if old and old != new_path:
-        try: os.remove(old)
-        except OSError: pass
-    sz = os.path.getsize(new_path)
+        await run_in_threadpool(_remove_files, [old])
+    sz = len(clip_bytes)
     print(f"[fall-clip] replaced Event {row['id']} video for {device_id} ({sz} B)")
     return {"replaced": row["id"], "bytes": sz}
 
