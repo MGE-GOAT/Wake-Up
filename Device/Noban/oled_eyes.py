@@ -231,11 +231,18 @@ def main():
         elif raw == "wakegreet":       # guest→active: idle 2s, happy 10s, idle
             state = "idle" if elapsed < 2.0 else ("happy" if elapsed < 12.0 else "idle")
 
-        img = eyes.render(state, t)
-        b = img.tobytes()
-        if b != last_bytes:
-            oled._blit(img)
-            last_bytes = b
+        try:
+            img = eyes.render(state, t)
+            b = img.tobytes()
+            if b != last_bytes:
+                oled._blit(img)        # I2C write — can transiently fail
+                last_bytes = b
+        except Exception as e:
+            # A single I2C hiccup must NOT kill a daemon meant to run for weeks.
+            # Log, drop the cached frame so the next good frame is re-blitted,
+            # and keep looping.
+            print(f"[oled-eyes] render/blit error (continuing): {e}", flush=True)
+            last_bytes = None
         time.sleep(period)
 
     try:

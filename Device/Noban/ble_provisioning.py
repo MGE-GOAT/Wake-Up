@@ -125,6 +125,9 @@ _setup_completed  = False
 # order, so an older app (Wi-Fi-first) still completes.
 _id_committed = False
 _wifi_done    = False
+# Allowed chars for a device_id written into the two-line id.txt (no newlines).
+_ID_ALLOWED = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
 _loop: Optional[asyncio.AbstractEventLoop] = None
 
 
@@ -214,14 +217,21 @@ def _join_wifi(ssid: str, psk: str) -> tuple[bool, str]:
     '802-11-wireless-security.key-mgmt: property is missing'. So: delete any
     stale profile for this SSID first, then create a fresh one with the
     security type pinned (wpa-psk), then bring it up."""
-    # 1. Wipe any existing profile(s) with this con-name so we start clean.
-    _run_nmcli("connection", "delete", ssid, timeout=15)
+    # Use a FIXED connection profile name, never the SSID. nmcli derives the
+    # on-disk profile filename from con-name; a hostile SSID (containing '/' or
+    # '..') as con-name could make NetworkManager write a profile at a crafted
+    # path as root. The real SSID is still carried by the `ssid` property (data,
+    # not a filename). A single fixed profile is also cleaner: one network at a
+    # time, re-created on each join.
+    con_name = "noban-wifi"
+    # 1. Wipe any existing profile so we start clean.
+    _run_nmcli("connection", "delete", con_name, timeout=15)
 
     if psk:
         # 2a. Secured network — create with key-mgmt explicitly set.
         rc, out, err = _run_nmcli(
             "connection", "add", "type", "wifi",
-            "con-name", ssid, "ifname", "wlan0", "ssid", ssid,
+            "con-name", con_name, "ifname", "wlan0", "ssid", ssid,
             "wifi-sec.key-mgmt", "wpa-psk", "wifi-sec.psk", psk,
             timeout=30,
         )
@@ -231,18 +241,18 @@ def _join_wifi(ssid: str, psk: str) -> tuple[bool, str]:
         # 2b. Open network — no security node at all.
         rc, out, err = _run_nmcli(
             "connection", "add", "type", "wifi",
-            "con-name", ssid, "ifname", "wlan0", "ssid", ssid,
+            "con-name", con_name, "ifname", "wlan0", "ssid", ssid,
             timeout=30,
         )
         if rc != 0:
             return False, (err.strip() or out.strip() or f"add rc={rc}")
 
     # 3. Activate it.
-    rc, out, err = _run_nmcli("connection", "up", ssid, timeout=60)
+    rc, out, err = _run_nmcli("connection", "up", con_name, timeout=60)
     if rc == 0:
         return True, ""
     # Clean up the failed profile so the next attempt starts fresh.
-    _run_nmcli("connection", "delete", ssid, timeout=15)
+    _run_nmcli("connection", "delete", con_name, timeout=15)
     return False, (err.strip() or out.strip() or f"up rc={rc}")
 
 
@@ -351,8 +361,20 @@ async def _handle_commit(payload: bytes) -> None:
     if not device_id or not password:
         _notify_done(b"err: device_id and password required")
         return
-    if len(password) < 32:
+    # device_id is the FIRST of two newline-delimited lines in id.txt that
+    # main.cpp parses. A newline/control char (or absurd length) would corrupt
+    # that format and permanently brick auth, so constrain it to a safe charset.
+    if (not isinstance(device_id, str) or not (1 <= len(device_id) <= 64)
+            or any(c not in _ID_ALLOWED for c in device_id)):
+        _notify_done(b"err: invalid device_id")
+        return
+    if not isinstance(password, str) or len(password) < 32:
         _notify_done(b"err: password must be >= 32 chars")
+        return
+    # Password is the SECOND line — a newline would spill into a bogus third
+    # line and corrupt the file the C++ side reads.
+    if "\n" in password or "\r" in password:
+        _notify_done(b"err: password must not contain newlines")
         return
     ok, err = await asyncio.get_running_loop().run_in_executor(
         None, _persist_id_txt, device_id, password

@@ -1411,7 +1411,13 @@ void playAlarm() {
     snd_pcm_hw_params_set_channels(handle, params, ALARM_CHANNELS);
     unsigned int rate = ALARM_RATE;
     snd_pcm_hw_params_set_rate_near(handle, params, &rate, nullptr);
-    snd_pcm_hw_params(handle, params);
+    // If hw_params fails the handle is left misconfigured and snd_pcm_writei
+    // would spin in an error loop, wedging the calling (WUW) thread. Bail.
+    if (snd_pcm_hw_params(handle, params) < 0) {
+        std::cerr << "ALARM: snd_pcm_hw_params failed; aborting playback\n";
+        snd_pcm_close(handle);
+        return;
+    }
     snd_pcm_writei(handle, buf.data(), nSamples);
     snd_pcm_drain(handle);
     snd_pcm_close(handle);
@@ -1892,6 +1898,16 @@ static void doFactoryReset() {
         std::cerr << "[button] WARNING: id.txt survived rm — truncating to force unprovisioned\n";
         std::system("sudo sh -c ': > /var/lib/elderly-care/id.txt' 2>/dev/null");
     }
+    // Same hard-guarantee for the home-dir fallback that loadDeviceIdentity ALSO
+    // reads — a survivor there (partial wipe / permissions) would re-provision the
+    // now server-purged identity, booting the device orphaned.
+    if (const char* home = std::getenv("HOME")) {
+        std::string h = std::string(home) + "/.config/elderly-care/id.txt";
+        if (std::ifstream(h).good()) {
+            std::cerr << "[button] WARNING: home id.txt survived — truncating\n";
+            std::system(("sh -c ': > \"" + h + "\"' 2>/dev/null").c_str());
+        }
+    }
     std::system("nmcli -t -f UUID,TYPE c show 2>/dev/null | awk -F: "
                 "  '$2==\"802-11-wireless\"{print $1}' "
                 "  | xargs -r -n1 sudo nmcli c delete 2>/dev/null");
@@ -2021,7 +2037,9 @@ static std::vector<uint8_t> muxClipFile(const std::string& video_path,
     { std::ofstream f(wav, std::ios::binary);
       f.write(reinterpret_cast<const char*>(wavbytes.data()), wavbytes.size()); }
     // Video is already mpeg4-encoded by the recorder → copy it, just add audio.
-    std::string cmdline = "ffmpeg -y -loglevel error -i " + video_path + " -i " + wav +
+    // `timeout 30` so a hung ffmpeg (corrupt MP4 / full disk) can't block this
+    // detached upload thread forever and leak it.
+    std::string cmdline = "timeout 30 ffmpeg -y -loglevel error -i " + video_path + " -i " + wav +
                           " -map 0:v -map 1:a -c:v copy -c:a aac -shortest " + out +
                           " 2>/dev/null";
     if (std::system(cmdline.c_str()) != 0) {
@@ -2275,8 +2293,12 @@ void housekeepingThread(std::atomic<bool>& running, std::shared_ptr<ServerComman
                                       (now - it->second >= PILL_REPLAY_PERIOD);
                     if (replay_due) { due.emplace_back(pa.id, pa.name); last_play_per_id[pa.id] = now; }
                 }
-                if (!due.empty()) {
-                    pill_player_busy->store(true);
+                // CAS the busy flag: only spawn when no playback is in flight, so
+                // rapid heartbeats can't launch overlapping pill threads that
+                // would fight for the ALSA amp. (Resets to false in the thread.)
+                bool _pill_expected = false;
+                if (!due.empty() &&
+                    pill_player_busy->compare_exchange_strong(_pill_expected, true)) {
                     // Capture cmd_client + the busy flag BY VALUE as shared_ptrs so
                     // the detached thread keeps them alive and can never dangle even
                     // if this thread / main exits while audio is still playing.
@@ -2291,6 +2313,10 @@ void housekeepingThread(std::atomic<bool>& running, std::shared_ptr<ServerComman
                             // held mic, so use plughw amp directly. PILL_AF overrides.
                             const char* _af = std::getenv("PILL_AF");
                             std::string _filt = _af ? _af : "loudnorm=I=-16:TP=-1.5:LRA=11";
+                            // PILL_AF is single-quoted into a shell command; a stray
+                            // quote would break out. Refuse it → safe default.
+                            if (_filt.find('\'') != std::string::npos)
+                                _filt = "loudnorm=I=-16:TP=-1.5:LRA=11";
                             std::string cmd = "timeout 30 ffmpeg -loglevel quiet -nostdin -i '" + audio +
                                 "' -af '" + _filt + "' -f wav - 2>/dev/null"
                                 " | timeout 30 aplay -q -D plughw:CARD=sndrpigooglevoi,DEV=0 -";
@@ -2311,9 +2337,9 @@ void housekeepingThread(std::atomic<bool>& running, std::shared_ptr<ServerComman
             }
             // Caregiver voice note — play ONCE on the amp, serialized with pills
             // via the SAME busy flag so the two can never collide on the device.
-            if (!st.voice_msg_url.empty() && !pill_player_busy->load()
-                    && !g_in_call.load()) {   // voice notes still play in guest
-                pill_player_busy->store(true);
+                bool _voice_expected = false;
+                if (!st.voice_msg_url.empty() && !g_in_call.load()   // plays in guest
+                    && pill_player_busy->compare_exchange_strong(_voice_expected, true)) {
                 std::string vurl = st.voice_msg_url;
                 std::thread([vurl, cmd_client, pill_player_busy] {
                     std::string vp = cmd_client->fetchVoiceMsg(vurl);
@@ -2321,6 +2347,8 @@ void housekeepingThread(std::atomic<bool>& running, std::shared_ptr<ServerComman
                         std::cout << "[voice] playing caregiver note\n";
                         const char* _af = std::getenv("PILL_AF");
                         std::string _filt = _af ? _af : "loudnorm=I=-16:TP=-1.5:LRA=11";
+                        if (_filt.find('\'') != std::string::npos)
+                            _filt = "loudnorm=I=-16:TP=-1.5:LRA=11";  // refuse quote breakout
                         std::string c = "timeout 30 ffmpeg -loglevel quiet -nostdin -i '" + vp +
                             "' -af '" + _filt + "' -f wav - 2>/dev/null"
                             " | timeout 30 aplay -q -D plughw:CARD=sndrpigooglevoi,DEV=0 -";
@@ -2462,14 +2490,24 @@ void fallPipelineThread(std::atomic<bool>& running, std::shared_ptr<ServerComman
             ring.slice(pre_from, static_cast<size_t>(now_c - pre_from), audio);  // whole window
             std::string vpath = CLIP_VIDEO_PATH;
             cv::Mat thumb = clip_thumb;
-            std::thread([cmd_client, danger, vpath, thumb,
-                         audio = std::move(audio)]() mutable {
-                auto clip = muxClipFile(vpath, audio);
-                auto jpeg = encodeJpeg(thumb);
-                if (cmd_client) cmd_client->sendEventPacket(jpeg, clip, danger);
-                std::cout << "[fall] event sent (danger=" << danger
-                          << ", clip " << clip.size() << "B)\n";
-            }).detach();
+            // Bound concurrent fall uploads: if a previous one is still in flight
+            // (slow network / hung mux), skip rather than stacking detached
+            // threads that each pin a multi-MB audio+video buffer.
+            static std::atomic<bool> fall_upload_busy(false);
+            bool _fall_exp = false;
+            if (fall_upload_busy.compare_exchange_strong(_fall_exp, true)) {
+                std::thread([cmd_client, danger, vpath, thumb,
+                             audio = std::move(audio)]() mutable {
+                    auto clip = muxClipFile(vpath, audio);
+                    auto jpeg = encodeJpeg(thumb);
+                    if (cmd_client) cmd_client->sendEventPacket(jpeg, clip, danger);
+                    std::cout << "[fall] event sent (danger=" << danger
+                              << ", clip " << clip.size() << "B)\n";
+                    fall_upload_busy.store(false);
+                }).detach();
+            } else {
+                std::cout << "[fall] previous upload still in flight — skipping\n";
+            }
         }
 
         // ── Fetch the latest frame from the grabber. Never blocks. If there's

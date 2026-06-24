@@ -180,11 +180,14 @@ def show(*lines):
 # ── beep (next-speaker cue) ──────────────────────────────────────────────────
 def beep():
     try:
-        subprocess.run(
-            ["ffmpeg", "-loglevel", "quiet", "-f", "lavfi",
-             "-i", "sine=frequency=880:duration=0.25", "-ar", "48000",
-             "-ac", "2", "-f", "wav", "-"],
-            stdout=open("/tmp/_noban_beep.wav", "wb"), check=False)
+        # `with` so the wav file descriptor is closed even if ffmpeg raises
+        # (the previous bare open() leaked an fd on every exception).
+        with open("/tmp/_noban_beep.wav", "wb") as f:
+            subprocess.run(
+                ["ffmpeg", "-loglevel", "quiet", "-f", "lavfi",
+                 "-i", "sine=frequency=880:duration=0.25", "-ar", "48000",
+                 "-ac", "2", "-f", "wav", "-"],
+                stdout=f, check=False)
         subprocess.run(["aplay", "-q", "-D", AMP_DEV, "/tmp/_noban_beep.wav"],
                        check=False)
     except Exception as e:

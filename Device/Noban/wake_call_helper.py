@@ -181,7 +181,10 @@ class Janus:
         r = await self._post("", {"janus": "create", "transaction": self._t()})
         self.session_id = r["data"]["id"]
         self._poll_task = asyncio.ensure_future(self._poll_loop())
-        asyncio.ensure_future(self._keepalive_loop())
+        # Keep a handle so close() can cancel it — otherwise the keepalive
+        # coroutine (and its 25s POSTs) lived on after the call ended, leaking a
+        # task + executor thread per call in the long-lived serve() daemon.
+        self._keepalive_task = asyncio.ensure_future(self._keepalive_loop())
 
     async def attach(self, plugin="janus.plugin.videoroom") -> int:
         r = await self._post(f"/{self.session_id}",
@@ -245,6 +248,12 @@ class Janus:
 
     def close(self):
         self._alive = False
+        # Cancel the long-poll + keepalive tasks so they don't linger (up to a
+        # 35s poll) or keep firing keepalives after the call ends.
+        for t in (getattr(self, "_poll_task", None),
+                  getattr(self, "_keepalive_task", None)):
+            if t is not None and not t.done():
+                t.cancel()
 
 
 def _plugindata(ev):
