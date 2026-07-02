@@ -815,6 +815,20 @@ async def message_device(request: Request):
                 username, msg_id)
             await _wake_redis.delete(f"imgreq:{image_req_id}", f"imgreq:dev:{_did}")
         else:
+            # The request was already fulfilled (a prior frame won the race)
+            # or it expired. Clear THIS device's pending flag so it stops
+            # re-capturing on every 100 ms heartbeat — otherwise a request the
+            # device can never satisfy would flood the server with uploads —
+            # and drop the orphan blob we just stored, since no subscriber will
+            # ever receive it. Best-effort: never let cleanup break the reply.
+            await _wake_redis.delete(f"imgreq:dev:{device_id}")
+            try:
+                await pool.execute("DELETE FROM messages WHERE id=$1", msg_id)
+                await run_in_threadpool(os.remove, image_path)
+                if has_video:
+                    await run_in_threadpool(os.remove, video_path)
+            except Exception:
+                pass
             return err({"error": "No user found for image_req_id"}, 404)
     elif message_type == "Event":
         await _fanout_subscribers(device_id, msg_id)
