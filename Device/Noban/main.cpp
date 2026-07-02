@@ -157,7 +157,7 @@ const long   DNS_CACHE_TIMEOUT_S = 300;
 constexpr const char* FACTORY_ID = "Noban";
 static std::string g_device_id;
 static std::string g_password;
-static std::string g_key_hash;        // sha256_hex(g_password) — sent in Key-Hash header
+static std::string g_key_hash;        // AUTH = sha256(sha256(g_password)) — the auth token sent in the Key-Hash header. NOT the media key: media_crypto derives that from g_password directly, so the server only ever receives this one-way-hashed token and can never derive the media key (E2E decoupling).
 static std::string g_mac;             // stable wlan MAC — sent in Device-Mac header
 
 // Guest / privacy "sleep" mode. Toggled by a 3-rapid-tap button gesture (woken
@@ -227,7 +227,7 @@ static void loadDeviceIdentity() {
 
     for (const auto& p : candidates) {
         if (readIdTxt(p, g_device_id, g_password)) {
-            g_key_hash = sha256_hex(g_password);
+            g_key_hash = sha256_hex(sha256_hex(g_password));  // AUTH = sha256(KEY_HASH); decoupled from the media key (media_crypto uses g_password) so the server never receives KEY_HASH
             std::cout << "[id] loaded from " << p
                       << " (device_id=" << g_device_id << ")\n";
             return;

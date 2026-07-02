@@ -17,10 +17,20 @@ import 'package:http/http.dart' as http;
 
 import '../configs.dart';
 
-/// Compute hex SHA-256 of the device password. Matches the server's
-/// `sha256_hex()` and the device's `loadDeviceIdentity()` in C++.
+/// KEY_HASH = hex SHA-256 of the device password. This is the media key
+/// material (see media_crypto.dart) — it is kept on the app and NEVER sent to
+/// the server. Matches the device's `sha256_hex(password)` in C++.
 String deviceKeyHash(String password) {
   return crypto.sha256.convert(utf8.encode(password)).toString();
+}
+
+/// AUTH = SHA-256(KEY_HASH) — the token the app sends to the server to prove
+/// knowledge of the device password. Because it is a one-way hash of the media
+/// key material, the server (which stores/receives it) can never derive the
+/// media key. Matches the device's `sha256_hex(sha256_hex(password))` and the
+/// server's stored device credential.
+String deviceAuthToken(String password) {
+  return crypto.sha256.convert(utf8.encode(deviceKeyHash(password))).toString();
 }
 
 sealed class ApiResult {
@@ -111,7 +121,7 @@ class DeviceApi {
   }) {
     return _post(registerDeviceEndpoint, {
       'device_id': deviceId,
-      'key_hash':  deviceKeyHash(devicePassword),
+      'key_hash':  deviceAuthToken(devicePassword),
     });
   }
 
@@ -124,7 +134,7 @@ class DeviceApi {
   }) {
     return _post(subscribeDeviceEndpoint, {
       'device_id': deviceId,
-      'key_hash':  deviceKeyHash(devicePassword),
+      'key_hash':  deviceAuthToken(devicePassword),
     });
   }
 
@@ -138,7 +148,7 @@ class DeviceApi {
   }) {
     return _post(replaceSubscriberEndpoint, {
       'device_id':       deviceId,
-      'key_hash':        deviceKeyHash(devicePassword),
+      'key_hash':        deviceAuthToken(devicePassword),
       'replace_target':  replaceTarget,
     });
   }
@@ -151,7 +161,7 @@ class DeviceApi {
   }) {
     return _post(unsubscribeDeviceEndpoint, {
       'device_id': deviceId,
-      'key_hash':  deviceKeyHash(devicePassword),
+      'key_hash':  deviceAuthToken(devicePassword),
     });
   }
 

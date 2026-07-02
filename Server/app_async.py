@@ -439,6 +439,26 @@ def read_file_as_base64(file_path):
 
 
 # ── auth ────────────────────────────────────────────────────────────────────
+def _kh_match(presented: str, stored: str) -> bool:
+    """Transition-safe device-credential check (E2E decoupling).
+
+    The device/app used to send KEY_HASH = sha256(device_password), which is
+    ALSO the media-encryption key material — so storing it let the server
+    derive the media key. They now send AUTH = sha256(KEY_HASH) instead and
+    keep KEY_HASH local for media only. During the cutover this accepts either
+    form with no lockout window: presented == stored (legacy KEY_HASH, or the
+    already-migrated AUTH), or presented == sha256(stored) (new AUTH vs a row
+    still holding KEY_HASH). After the one-time key_hash->sha256(key_hash)
+    migration the first branch handles the new token; the second is then inert.
+    """
+    if not presented or not stored:
+        return False
+    if hmac.compare_digest(presented, stored):
+        return True
+    return hmac.compare_digest(
+        presented, hashlib.sha256(stored.encode()).hexdigest())
+
+
 async def verify_device_auth(request: Request):
     """Returns (device_record, err_response_or_None). On failure the second
     element is a JSONResponse the caller should return directly."""
@@ -453,7 +473,7 @@ async def verify_device_auth(request: Request):
     if dev is None:
         return None, err({"error": "Invalid Device"}, 403)
     presented = key_hash or hashlib.sha256(legacy.encode()).hexdigest()
-    if not hmac.compare_digest(presented, dev["key_hash"]):
+    if not _kh_match(presented, dev["key_hash"]):
         return None, err({"error": "Invalid credentials"}, 403)
     return dev, None
 
@@ -1066,7 +1086,7 @@ async def subscribe_app(request: Request):
     if not device_id or not key_hash:
         return err({"error": "Missing device_ID or Key_Hash"}, 400)
     device = await pool.fetchrow("SELECT key_hash FROM active_devices WHERE device_id=$1", device_id)
-    if device is None or not hmac.compare_digest(device["key_hash"], key_hash):
+    if device is None or not _kh_match(key_hash, device["key_hash"]):
         return err({"error": "Invalid device ID or Key_Hash"}, 403)
     existing = await pool.fetchrow(
         "SELECT 1 FROM subscriptions WHERE username=$1 AND device_id=$2", username, device_id)
@@ -1745,7 +1765,7 @@ async def subscribe_device(request: Request):
     dev = await pool.fetchrow("SELECT key_hash FROM devices WHERE device_id=$1", device_id)
     if dev is None:
         return err({"error": "device_not_found"}, 404)
-    if not hmac.compare_digest(dev["key_hash"], key_hash):
+    if not _kh_match(key_hash, dev["key_hash"]):
         return err({"error": "wrong_password"}, 403)
     already = await pool.fetchrow(
         "SELECT 1 FROM subscriptions WHERE device_id=$1 AND username=$2", device_id, username)
@@ -1785,7 +1805,7 @@ async def replace_subscriber(request: Request):
     dev = await pool.fetchrow("SELECT key_hash FROM devices WHERE device_id=$1", device_id)
     if dev is None:
         return err({"error": "device_not_found"}, 404)
-    if not hmac.compare_digest(dev["key_hash"], key_hash):
+    if not _kh_match(key_hash, dev["key_hash"]):
         return err({"error": "wrong_password"}, 403)
     target = await pool.fetchrow(
         "SELECT 1 FROM subscriptions WHERE device_id=$1 AND username=$2", device_id, replace_target)
@@ -1822,7 +1842,7 @@ async def unsubscribe_device(request: Request):
     dev = await pool.fetchrow("SELECT key_hash FROM devices WHERE device_id=$1", device_id)
     if dev is None:
         return err({"error": "device_not_found"}, 404)
-    if not hmac.compare_digest(dev["key_hash"], key_hash):
+    if not _kh_match(key_hash, dev["key_hash"]):
         return err({"error": "wrong_password"}, 403)
     async with pool.acquire() as conn:
         async with conn.transaction():
