@@ -47,7 +47,7 @@ import signal
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
 
 try:
     from bless import (

@@ -1,0 +1,99 @@
+# Noban settings for the vendored fall-cpp. Pipeline values are identical to config.yaml; only runtime threads/paths differ.
+# ======================================================================================
+# Fall detector (C++ / Raspberry Pi) - configuration.
+# Run:  ./build/fall_detector config.yaml [camera|infer]
+# All pipeline values are copied from the final Python config (default.yaml); the sections
+# that are new for the C++ project are `runtime`, `camera`, `infer` and the yolo model files.
+# Relative paths are relative to the directory the program is started from.
+# ======================================================================================
+mode: camera              # camera | infer   (can also be given on the command line)
+
+paths:
+  models_dir: fall_cpp/models     # contains RTMPose-t.onnx, svm.onnx(+.meta.json), cnn.onnx(+.meta.json), yolo ncnn files
+
+runtime:                 # threads used to run each model
+  yolo_threads: 2        # ncnn, yolo11n-320 (2 threads keep up with real time on the Pi 4 next to the rest of the device)
+  pose_threads: 2        # ONNX Runtime, RTMPose-t
+  classifier_threads: 1  # ONNX Runtime, SVM and CNN (tiny models)
+
+temporal:
+  target_fps: 16         # canonical rate for videos AND the camera stream
+  batch_size: 16         # module input; must equal window_size
+  window_size: 16
+  fallback_fps: 25.0     # used only if a video file reports an invalid fps
+
+input:
+  max_side: 960          # frames are downscaled (aspect kept) so the longer side <= this; null = off
+
+models:
+  strict_signature: true # refuse svm/cnn trained with a different feature definition
+
+camera:                  # camera mode
+  source: /dev/video9    # device path or index
+  width: 640
+  height: 480
+  trust_camera_rate: true    # the camera already delivers target_fps; otherwise frames are resampled by time
+  max_backlog_batches: 4     # if processing falls behind real time, older frames are dropped (with a warning)
+  log_timing: false           # print the time spent in each stage per batch
+
+infer:
+  videos: []
+  video_list_file: ""    # or a text file with one video path per line (see tools/compare_with_python.py list)
+  output_dir: results_cpp
+
+# ---------------------------------------------------------------- person box sub-module
+bbox:
+  yolo:
+    enabled: true
+    param: yolo11n-320.ncnn.param
+    bin: yolo11n-320.ncnn.bin
+    input_name: in0
+    output_name: out0
+    input_size: 320
+    every_n_frames: 8                # t; must divide batch_size
+    conf: 0.25
+    iou_nms: 0.5
+    full_frame_every_n_runs: 8       # when no ROI exists, search the full frame every n-th run
+  background: {grid: 16, update_margin: 0.02}
+  coarse: {width: 80, threshold: 45, kernel: 7, close_iterations: 2, min_area_ratio: 0.0005,
+           max_area_ratio: 0.8, diff_step: 4}
+  fine: {size: 70, threshold: 40, temporal_threshold: 35, kernel: 5, close_iterations: 3,
+         min_area_ratio: 0.0005, pad_ratio: 0.01}
+  roi: {margin_with_yolo: 1.4, margin_without_yolo: 2.0, min_side_frac: 0.33}
+  fusion: {weight_yolo: 1.0, weight_bg: 0.25, weight_interp: 0.25, bg_score: 0.3,
+           bg_gate_iou: 0.05, max_gap_frames: 12}
+  smoothing: {half_window: 6, sigma: 3.0}     # look-ahead = half_window + max_gap_frames
+  multi_person: {conf: 0.4, confirm_runs: 3, suspend_batches: 3}
+
+# ---------------------------------------------------------------- shared feature definitions
+representation:
+  point_order: legacy
+  channels: 3                # 2 = (x, y); 3 = (x, y, confidence)
+  batch_bbox_margin: 1.2
+  pose_smoothing: {half_window: 3, sigma: 2.0}
+
+pose:
+  model: RTMPose-t.onnx
+  input_size: [192, 256]     # (w, h) of the model input
+  bbox_padding: 1.3
+  simcc_split_ratio: 2.0
+  rgb_input: true            # as in the Python framework (the Python training used RGB)
+
+# ---------------------------------------------------------------- cascade
+classic:
+  svm_model: svm.onnx
+  svm_threshold: 0.4
+  use_model_threshold: true  # use the threshold stored in svm.meta.json
+  high_sensitive: {suppress_vr_below: 0.001, suppress_vc_below: -0.001,
+                   force_vc_above: 0.02, force_vr_above: 0.01}
+  post1: {min_count: 8}
+  post2: {min_count: 6}
+
+deep:
+  cnn_model: cnn.onnx
+  cnn_threshold: 0.98
+  use_model_threshold: false
+  window_stride: 1
+  cooldown_batches: 6
+  min_mean_confidence: 0.35
+  min_frame_confidence: 0.05

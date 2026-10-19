@@ -21,7 +21,7 @@ elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch32|armv7|armhf")
     message(STATUS "Target: ARMv7 32-bit (Raspberry Pi 3 — legacy Raspbian)")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -march=armv7-a -mfpu=neon-vfpv4 -ftree-vectorize -ffast-math")
 else()
-    message(STATUS "Target: x86_64 (PC / Kali)")
+    message(STATUS "Target: x86_64 (PC / dev box)")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -march=native -ftree-vectorize -ffast-math")
 endif()
 
@@ -46,6 +46,36 @@ add_executable(pipeline
     media_crypto.cpp
     gpio_io.cpp
 )
+
+# ── Fall detection engine ─────────────────────────────────────────────────
+# USE_FALL_CPP=ON  (default): vendored fall_cpp (yolo11n via ncnn + RTMPose-t / SVM / CNN via
+#                  ONNX Runtime), bridged by fall_adapter.cpp. fall_detection.cpp (old MoveNet
+#                  engine) stays compiled for the --fall-video / parity debug modes.
+# USE_FALL_CPP=OFF: old engine only. Needs no ncnn.
+# ncnn: install prefix via -DNCNN_DIR=... (default ~/ncnn/build/install).
+option(USE_FALL_CPP "Use the vendored fall_cpp detector for live fall detection" ON)
+if(USE_FALL_CPP)
+    set(FALL_CPP_DIR "${CMAKE_SOURCE_DIR}/fall_cpp")
+    set(NCNN_DIR "$ENV{HOME}/ncnn/build/install" CACHE PATH "ncnn install prefix")
+    set(ncnn_DIR "${NCNN_DIR}/lib/cmake/ncnn")
+    find_package(ncnn REQUIRED)
+    find_package(OpenMP REQUIRED)     # ncnn is built with OpenMP
+    target_sources(pipeline PRIVATE
+        fall_adapter.cpp
+        ${FALL_CPP_DIR}/src/representation.cpp ${FALL_CPP_DIR}/src/classic_stage.cpp
+        ${FALL_CPP_DIR}/src/deep_stage.cpp ${FALL_CPP_DIR}/src/detector.cpp
+        ${FALL_CPP_DIR}/src/track_fusion.cpp ${FALL_CPP_DIR}/src/vision_utils.cpp
+        ${FALL_CPP_DIR}/src/config.cpp ${FALL_CPP_DIR}/src/json_util.cpp
+        ${FALL_CPP_DIR}/src/result_writer.cpp ${FALL_CPP_DIR}/src/pipeline.cpp
+        ${FALL_CPP_DIR}/src/person_box_module.cpp ${FALL_CPP_DIR}/src/background.cpp
+        ${FALL_CPP_DIR}/src/yolo_ncnn.cpp ${FALL_CPP_DIR}/src/onnx_models.cpp
+        ${FALL_CPP_DIR}/src/video_source.cpp)
+    target_include_directories(pipeline PRIVATE ${FALL_CPP_DIR}/src "${NCNN_DIR}/include")
+    target_compile_definitions(pipeline PRIVATE USE_FALL_CPP=1)
+    target_link_libraries(pipeline PRIVATE ncnn OpenMP::OpenMP_CXX)
+else()
+    target_compile_definitions(pipeline PRIVATE USE_FALL_CPP=0)
+endif()
 
 # ── libgpiod v2 — push button + RGB LED on Pi OS Trixie (sysfs GPIO removed).
 # apt: libgpiod-dev. If absent (dev box), gpio_io.cpp compiles HAVE_GPIOD=0
@@ -73,8 +103,7 @@ else()
     message(STATUS "libsodium: NOT found — media will be sent in plaintext")
 endif()
 
-# ── paho-mqtt-cpp — Phase 5.1 transport. Replaces the /Live_Device HTTP
-# poll with persistent broker subscriptions. apt: libpaho-mqttpp-dev (+ its
+# ── paho-mqtt-cpp — MQTT client for device status and control messages. apt: libpaho-mqttpp-dev (+ its
 # C lib libpaho-mqtt-dev as transitive). Header is <mqtt/async_client.h>.
 #
 # Optional: if the libs aren't installed (e.g. on a dev box that doesn't

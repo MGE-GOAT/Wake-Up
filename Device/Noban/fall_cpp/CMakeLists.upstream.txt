@@ -1,0 +1,81 @@
+cmake_minimum_required(VERSION 3.16)
+project(fall_detector LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
+# Raspberry Pi 4 (Cortex-A72) tuning, as in the sample projects.  -ffast-math is deliberately NOT used:
+# the results of this program are compared with the Python implementation, so the arithmetic must
+# stay predictable.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+    add_compile_options(-O3 -march=armv8-a+crc -mtune=cortex-a72 -ftree-vectorize)
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "armv7|armhf|armv6")
+    add_compile_options(-O3 -march=armv7-a -mfpu=neon-vfpv4 -ftree-vectorize)
+else()
+    add_compile_options(-O2)
+endif()
+
+# ---------------------------------------------------------------------------------------------
+# fd_core: the cascade logic (features, SVM stage, CNN stage, streaming contract, box fusion,
+# decoding, config).  It needs no external library, so it can be built and tested anywhere.
+# ---------------------------------------------------------------------------------------------
+add_library(fd_core STATIC
+    src/representation.cpp src/classic_stage.cpp src/deep_stage.cpp src/detector.cpp
+    src/track_fusion.cpp src/vision_utils.cpp src/config.cpp src/json_util.cpp src/result_writer.cpp)
+target_include_directories(fd_core PUBLIC src)
+
+option(BUILD_TESTS "Build the golden tests of fd_core (no external libraries needed)" OFF)
+if(BUILD_TESTS)
+    enable_testing()
+    add_executable(test_core tests/test_core.cpp)
+    target_link_libraries(test_core PRIVATE fd_core)
+    add_test(NAME golden_vs_python
+             COMMAND test_core ${CMAKE_SOURCE_DIR}/tests/golden/golden.txt
+                               ${CMAKE_SOURCE_DIR}/tests/golden/python_default.yaml
+                               ${CMAKE_SOURCE_DIR}/config.yaml)
+endif()
+
+# ---------------------------------------------------------------------------------------------
+# fall_detector: OpenCV + ncnn (yolo11n) + ONNX Runtime (RTMPose-t, SVM, CNN)
+# ---------------------------------------------------------------------------------------------
+option(BUILD_APP "Build the fall_detector executable" ON)
+if(BUILD_APP)
+    find_package(OpenCV REQUIRED COMPONENTS core imgproc videoio)
+    message(STATUS "OpenCV: ${OpenCV_VERSION}")
+
+    # ncnn: the install prefix of your ncnn build (the one used by the ncnn-example project).
+    set(NCNN_DIR "$ENV{HOME}/ncnn/build/install" CACHE PATH "ncnn install prefix")
+    set(ncnn_DIR "${NCNN_DIR}/lib/cmake/ncnn")
+    find_package(ncnn REQUIRED)
+    message(STATUS "ncnn: ${ncnn_DIR}")
+
+    # ONNX Runtime: same layout as the rtmpose_pi_cpp project (deps/onnxruntime/{include,lib}).
+    set(ORT_ROOT "${CMAKE_SOURCE_DIR}/deps/onnxruntime" CACHE PATH "ONNX Runtime root")
+    find_path(ONNXRUNTIME_INCLUDE_DIR NAMES onnxruntime_cxx_api.h
+        HINTS "${ORT_ROOT}/include" /usr/local/include/onnxruntime /usr/include/onnxruntime)
+    find_library(ONNXRUNTIME_LIBRARY NAMES onnxruntime
+        HINTS "${ORT_ROOT}/lib" "${ORT_ROOT}/lib64" /usr/local/lib /usr/lib/aarch64-linux-gnu /usr/lib/arm-linux-gnueabihf)
+    if(NOT ONNXRUNTIME_INCLUDE_DIR OR NOT ONNXRUNTIME_LIBRARY)
+        message(FATAL_ERROR "ONNX Runtime not found. Put its headers in ${ORT_ROOT}/include and libonnxruntime.so "
+                            "in ${ORT_ROOT}/lib, or pass -DORT_ROOT=<path>.")
+    endif()
+    message(STATUS "ONNX Runtime: ${ONNXRUNTIME_LIBRARY}")
+
+    find_package(OpenMP REQUIRED)     # ncnn is built with OpenMP
+    find_package(Threads REQUIRED)
+
+    add_executable(fall_detector
+        src/main.cpp src/pipeline.cpp src/person_box_module.cpp src/background.cpp
+        src/yolo_ncnn.cpp src/onnx_models.cpp src/video_source.cpp)
+    target_include_directories(fall_detector PRIVATE ${OpenCV_INCLUDE_DIRS} ${ONNXRUNTIME_INCLUDE_DIR} "${NCNN_DIR}/include")
+    target_link_libraries(fall_detector PRIVATE fd_core ncnn ${OpenCV_LIBS} ${ONNXRUNTIME_LIBRARY}
+                                                OpenMP::OpenMP_CXX Threads::Threads)
+    set_target_properties(fall_detector PROPERTIES BUILD_RPATH "${ORT_ROOT}/lib"
+                                                   INSTALL_RPATH "$ORIGIN/../lib;$ORIGIN/../lib64")
+    install(TARGETS fall_detector RUNTIME DESTINATION bin)
+endif()

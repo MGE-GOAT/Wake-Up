@@ -198,11 +198,6 @@ class Janus:
         # Janus returns an immediate ack; the real plugindata/jsep arrives via long-poll.
         return await self._post(f"/{self.session_id}/{handle}", msg)
 
-    async def trickle_complete(self, handle: int):
-        await self._post(f"/{self.session_id}/{handle}",
-                         {"janus": "trickle", "candidate": {"completed": True},
-                          "transaction": self._t()})
-
     async def _keepalive_loop(self):
         while self._alive:
             await asyncio.sleep(25)

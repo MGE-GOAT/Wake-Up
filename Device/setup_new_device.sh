@@ -468,6 +468,26 @@ fi
          echo "       Make sure deps/tensorflow-src exists, then re-run this script." >&2; exit 1; }
 ok "TFLite headers staged (deps/tflite/include)"
 
+# ncnn (yolo11n person detector of the vendored fall_cpp detector). Built from source into
+# ~/ncnn/build/install, the default NCNN_DIR the Noban CMakeLists looks in. CPU only (no Vulkan).
+NCNN_TAG="${NCNN_TAG:-20250503}"
+NCNN_PREFIX="${NCNN_DIR:-$HOME/ncnn/build/install}"
+if [ ! -f "${NCNN_PREFIX}/lib/cmake/ncnn/ncnnConfig.cmake" ]; then
+    say "building ncnn ${NCNN_TAG} (CPU only) -> ${NCNN_PREFIX}"
+    clone_retry "$HOME/ncnn" clone --depth 1 -b "$NCNN_TAG" https://github.com/Tencent/ncnn \
+      || { warn "ncnn clone failed after retries — check the network/proxy and re-run (idempotent)"; exit 1; }
+    mkdir -p "$HOME/ncnn/build"
+    ( cd "$HOME/ncnn/build" \
+      && cmake -DCMAKE_BUILD_TYPE=Release -DNCNN_VULKAN=OFF -DNCNN_BUILD_TOOLS=OFF -DNCNN_BUILD_EXAMPLES=OFF \
+               -DNCNN_BUILD_BENCHMARK=OFF -DNCNN_BUILD_TESTS=OFF -DNCNN_SHARED_LIB=OFF \
+               -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DCMAKE_INSTALL_PREFIX="${NCNN_PREFIX}" .. \
+      && make -j"$(nproc)" install ) \
+      || { warn "ncnn build failed"; exit 1; }
+    ok "ncnn ${NCNN_TAG} built"
+else
+    ok "ncnn already built (${NCNN_PREFIX})"
+fi
+
 # =============================================================================
 # 4. BUILD THE PIPELINE (CMake)
 #    CMakeLists auto-detects ARM64 and applies the Cortex-A72 flags. It finds

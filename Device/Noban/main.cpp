@@ -1,5 +1,5 @@
 // =========================================================
-// Farsi Wake Word + Command Pipeline — Kali Linux
+// Farsi Wake Word + Command Pipeline
 // All models pre-loaded at startup — no reload per detection
 // =========================================================
 #include <iostream>
@@ -10,15 +10,14 @@
 #include <numeric>
 #include <algorithm>
 #include <thread>
-#include <queue>
 #include <mutex>
+#include <deque>
 #include <atomic>
 #include <unordered_map>
 #include <unordered_set>
 #include <chrono>
 #include <functional>
 #include <alsa/asoundlib.h>
-#include "rnnoise.h"
 #include "onnxruntime_cxx_api.h"
 #include <complex>
 #include "pocketfft_hdronly.h"
@@ -32,13 +31,18 @@
 #include <ctime>
 #include <filesystem>
 #include <fstream>
-#include <sys/stat.h>   // stat() used by _led_export_pin
 #include <unistd.h>
 #include <opencv2/core.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/videoio.hpp>
 #include "pain_pipeline.hpp"
 #include "fall_detection.hpp"
+#ifndef USE_FALL_CPP
+#define USE_FALL_CPP 0
+#endif
+#if USE_FALL_CPP
+#include "fall_adapter.hpp"   // vendored fall_cpp: yolo11n + RTMPose-t + SVM + CNN
+#endif
 #include "parity_dump.hpp"
 #include "mqtt_client.hpp"
 #include "media_crypto.hpp"   // Phase 3.1 — E2E encrypt fall/snapshot media
@@ -56,12 +60,7 @@ const int    RECORD_SECONDS = 5;        // 5 s of post-wake audio is plenty for
                                         // two-word commands ("قرص", "تماس") and
                                         // also acts as the buffer for the
                                         // fallback voice-message path.
-// RPi 4 has 4 cores. Budget when both WUW + fall_detection are inferring:
-//   2 cores for WUW DS-CNN-QAT (this constant)
-//   2 cores for fall MoVeNet TFLite (FallDetection ctor SetNumThreads(2))
-//   1 core for OS / camera capture / mic capture (overlap; all I/O bound)
-// Was 3 before fall_detection landed — drop to 2 to avoid oversubscription.
-const int    N_THREADS      = 2;        // RPi 4: 2 of 4 cores for WUW
+// The fall detector runs at a lower priority than the rest of the device (see fall_adapter.cpp).
 // ── ALSA device names — for I2S MEMS mic (INMP441) and I2S amp (MAX98357A)
 // on the Pi, configure /etc/asound.conf so "default" routes to your cards,
 // OR change these constants to e.g. "plughw:CARD=sndrpisimplecar,DEV=0".
@@ -77,18 +76,13 @@ const char*  ALSA_PLAYBACK_DEV = "plughw:CARD=sndrpigooglevoi,DEV=0";
 #ifndef USE_S32_CAPTURE
 #define USE_S32_CAPTURE 0
 #endif
-const int    RNNOISE_FRAMES = 480;
-const int    VAD_WINDOW     = 512;
-const float  VAD_THRESHOLD  = 0.5f;
 // All values match the trained Python pipeline (Ds-CNN-QAT.ipynb, cell 18).
 const int    STRIDE_SAMPLES = 4800;     // 300 ms — must match training
-const int    WINDOW_SAMPLES = 16000;    // 1 s — used for PCEN warmup buffers only
-// Decision-layer settings. 0.3/0.60 is the high-recall config; 0.4/0.70 is
-// high-precision. Both work for adult wake-word detection; the additional
-// gates (margin, N-consecutive, Schmitt re-arm) close the FAR gap from kid
-// speech and bursty negatives without sacrificing recall.
-const float  ALPHA          = 0.3f;     // EMA smoothing on per-class probs
-const float  THRESHOLD_UP   = 0.60f;    // EMA wake-prob fire threshold (normal mode)
+// Decision-layer settings: EMA smoothing on the per-class probabilities, a fire
+// threshold, and extra gates (margin, N-consecutive, Schmitt re-arm) that keep
+// kid speech and bursty negatives from firing.
+const float  ALPHA          = 0.4f;     // EMA smoothing on per-class probs
+const float  THRESHOLD_UP   = 0.50f;    // EMA wake-prob fire threshold (normal mode)
 const float  GUEST_NOBAN_UP = 0.40f;    // lower "Noban" EMA bar in sleep (the "Hey" gate adds the precision)
 const float  NOBAN_GATE_RAW = 0.50f;    // raw "Noban" peak fast-path in sleep (fluid "Hey Noban"; Hey-gated so safe)
 const float  THRESHOLD_DOWN = 0.30f;    // Schmitt re-arm: EMA must dip below this to refire
@@ -108,7 +102,6 @@ const float  PCEN_TIME_C    = 0.10f;    // faster smoothing — matches training
 const float  PCEN_EPS       = 1e-3f;    // higher floor — kills silence amplification
 const char*  TFLITE_MODEL   = "./models/noban_int8.tflite";   // retrained main "Noban" wake model
 const char*  HEY_MODEL      = "./models/hey_int8.tflite";     // "Hey" pre-gate model (guest double-gate)
-const char*  SILERO_MODEL   = "./models/silero_vad.onnx";
 const char*  YAMNET_MODEL   = "./models/yamnet.tflite";
 const char*  PAIN_MODEL     = "./models/pain_logmel5.tflite";
 // All command interpretation (STT + LLM intent match + routing) lives on the
@@ -126,7 +119,7 @@ const char*  PAIN_MODEL     = "./models/pain_logmel5.tflite";
 //
 // The device doesn't care what the server decided; it only checks HTTP 200
 // to log success/failure.
-const char*  SERVER_BASE_URL    = "http://192.168.1.104:5000";
+const char*  SERVER_BASE_URL    = "http://192.168.1.104:5000";   // dev default only, the systemd unit sets SERVER_URL
 const char*  WAKE_CMD_ENDPOINT  = "/Wake_Command";
 const char*  LIVE_ENDPOINT      = "/Live_Device";     // heartbeat + image_req
 const char*  MSG_ENDPOINT       = "/Message_Device";  // image or image+video
@@ -166,9 +159,8 @@ static std::string g_mac;             // stable wlan MAC — sent in Device-Mac 
 // over): no fall events, no snapshots, camera released. Everything else keeps
 // working — WUW still runs (so the elder can still get help), pill playback,
 // caregiver voice notes, and incoming calls all still fire. To suppress false
-// WUW fires from chatter, the wake is DOUBLE-GATED in guest: a lenient raw
-// "Hey" must open a window, then the full strict-EMA "Noban" must fire within
-// it. The button (to wake) and heartbeat (server/app liveness) keep running.
+// WUW fires from chatter, the wake is DOUBLE-GATED in guest: a lenient "Hey"
+// EMA must open a window, then "Noban" must fire within it. The button (to wake) and heartbeat (server/app liveness) keep running.
 // RAM-only: a reboot comes back ACTIVE so a power blip can't silently leave
 // the elder unmonitored.
 std::atomic<bool> g_guest_mode{false};
@@ -258,10 +250,9 @@ static void loadDeviceIdentity() {
 // adding/editing commands doesn't require a Pi re-flash.
 
 // =========================================================
-// MIC CAPTURE — single ALSA handle owned by main. WUW inference runs in the
-// same thread (merged producer+consumer): the 300ms blocking read paces the
-// loop, the ~20ms per-stride inference fits comfortably in the kernel ring
-// buffer's headroom (xrun threshold is hundreds of ms).
+// MIC CAPTURE — audioCaptureThread is the only ALSA capture opener. It fills
+// the AudioRing, and main() consumes the ring one 300 ms stride at a time for
+// WUW inference.
 // =========================================================
 #if USE_S32_CAPTURE
 // INMP441 is a 24-bit mic delivered in S32_LE frames, but the i2s shifting
@@ -719,48 +710,8 @@ struct WakeWordDetector {
 };
 
 // =========================================================
-// SILERO VAD — loaded once, reset between detections
-// =========================================================
-struct SileroVAD {
-    Ort::Env env; Ort::Session* session=nullptr;
-    std::vector<float> state;  // shape [2, 1, 128] — v5 model
-    SileroVAD():env(ORT_LOGGING_LEVEL_WARNING,"silero"){}
-    bool init(const char* path) {
-        Ort::SessionOptions opts; opts.SetIntraOpNumThreads(1);
-        try {
-            session=new Ort::Session(env,path,opts);
-            state.assign(2*1*128,0.f);
-            std::cout<<"✅ Silero VAD loaded\n"; return true;
-        } catch(...) { std::cerr<<"VAD: failed to load\n"; return false; }
-    }
-    void reset() { std::fill(state.begin(),state.end(),0.f); }
-    float process(const float* data,int len) {
-        if (!session) return 1.0f;
-        Ort::MemoryInfo mi=Ort::MemoryInfo::CreateCpu(OrtArenaAllocator,OrtMemTypeDefault);
-        std::vector<float> audio(data,data+len);
-        std::vector<int64_t> aShape={1,(int64_t)len}, sShape={2,1,128}, srShape={};
-        int64_t srVal=16000;
-        std::vector<Ort::Value> inputs;
-        inputs.push_back(Ort::Value::CreateTensor<float>(mi,audio.data(),audio.size(),aShape.data(),2));
-        inputs.push_back(Ort::Value::CreateTensor<float>(mi,state.data(),state.size(),sShape.data(),3));
-        inputs.push_back(Ort::Value::CreateTensor<int64_t>(mi,&srVal,1,srShape.data(),0));
-        const char* in[]={"input","state","sr"}; const char* out[]={"output","stateN"};
-        auto outputs=session->Run(Ort::RunOptions{nullptr},in,inputs.data(),3,out,2);
-        float prob=outputs[0].GetTensorData<float>()[0];
-        auto* sn=outputs[1].GetTensorData<float>();
-        std::copy(sn,sn+state.size(),state.begin());
-        return prob;
-    }
-    ~SileroVAD(){ delete session; }
-    SileroVAD(const SileroVAD&)=delete;             // owns a raw Ort::Session*
-    SileroVAD& operator=(const SileroVAD&)=delete;  // → forbid copy/move (double-free)
-    SileroVAD(SileroVAD&&)=delete;
-    SileroVAD& operator=(SileroVAD&&)=delete;
-};
-
-// =========================================================
 // SERVER COMMAND CLIENT — STT + intent matching live on the server.
-// Pipeline: record -> denoise -> VAD -> serialize to 16-bit PCM WAV
+// Pipeline: record -> serialize to 16-bit PCM WAV
 //        -> HTTP POST audio/wav to {SERVER_BASE_URL}{WAKE_CMD_ENDPOINT}
 //        -> server returns JSON { "matched": "<Farsi command>" }
 // =========================================================
@@ -821,7 +772,7 @@ struct ServerCommandClient {
     ~ServerCommandClient() { curl_global_cleanup(); }
 
     // ── Single endpoint the Pi cares about: POST the 5-s post-wake clip
-    //    as audio/wav (with Device-ID + Authentication-Code headers so the
+    //    as audio/wav (with Device-Id + Key-Hash headers so the
     //    server knows which device's reminders/inbox to touch). The server
     //    runs STT + intent match + routing; the Pi just checks HTTP 200.
     // Server's /Wake_Command response intent. The Pi acts on PILL (silences
@@ -1089,34 +1040,6 @@ struct ServerCommandClient {
         return st;
     }
 
-    // ── POST /Pill_Ack_Device when wake-fire returns PILL intent.
-    bool sendPillAck(int pill_schedule_id = -1) {
-        std::string url = base_url + "/Pill_Ack_Device";
-        std::string body = pill_schedule_id >= 0
-            ? std::string("{\"pill_schedule_id\":") + std::to_string(pill_schedule_id) + "}"
-            : "{}";
-        std::string response;
-        CURL* curl = curl_easy_init(); if (!curl) return false;
-        std::string id_hdr = std::string("Device-Id: ") + DEVICE_ID;
-        std::string ac_hdr = std::string("Key-Hash: ") + KEY_HASH;
-        struct curl_slist* hdrs = nullptr;
-        hdrs = curl_slist_append(hdrs, "Content-Type: application/json");
-        hdrs = curl_slist_append(hdrs, id_hdr.c_str());
-        hdrs = curl_slist_append(hdrs, ac_hdr.c_str());
-        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-        curl_easy_setopt(curl, CURLOPT_POST, 1L);
-        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.c_str());
-        curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)body.size());
-        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
-        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 5L);
-        CURLcode rc = curl_easy_perform(curl);
-        long code = 0;
-        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
-        curl_slist_free_all(hdrs);
-        curl_easy_cleanup(curl);
-        return rc == CURLE_OK && code == 200;
-    }
-
     // ── Fetch a pill audio file by its server-side id; save to /tmp.
     //    Returns the local file path on success, empty on failure.
     std::string fetchPillAudio(int pill_schedule_id) {
@@ -1210,43 +1133,6 @@ struct ServerCommandClient {
                          const std::vector<uint8_t>& mp4,
                          int danger_level) {
         return postMessageDevice("Event", -1, jpeg, mp4, danger_level);
-    }
-
-    // ── Replace the newest fall Event's video with the finished A/V clip
-    //    (already E2E-encrypted by the caller). Device-authenticated multipart.
-    bool postFallClipReplace(const std::vector<uint8_t>& enc_clip) {
-        if (enc_clip.empty()) return false;
-        CURL* curl = curl_easy_init();
-        if (!curl) return false;
-        curl_mime* mime = curl_mime_init(curl);
-        curl_mimepart* part = curl_mime_addpart(mime);
-        curl_mime_name(part, "video file");
-        curl_mime_filename(part, "fall_av.mp4");
-        curl_mime_data(part, reinterpret_cast<const char*>(enc_clip.data()),
-                       enc_clip.size());
-        std::string id_hdr = std::string("Device-Id: ") + DEVICE_ID;
-        std::string ac_hdr = std::string("Key-Hash: ") + KEY_HASH;
-        struct curl_slist* hdrs = nullptr;
-        hdrs = curl_slist_append(hdrs, id_hdr.c_str());
-        hdrs = curl_slist_append(hdrs, ac_hdr.c_str());
-        std::string url = base_url + "/Fall_Clip_Replace_Device";
-        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-        curl_easy_setopt(curl, CURLOPT_MIMEPOST, mime);
-        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
-        // Fall-clip upload: keep 30s total (clip can be large), but fail fast on
-        // unreachable server (5s connect) and abort a stalled upload
-        // (< 1KB/s for 15s) so a flaky network can't hang it indefinitely.
-        curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
-        curl_easy_setopt(curl, CURLOPT_TIMEOUT, HTTP_TIMEOUT_S);
-        curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1024L);
-        curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 15L);
-        curl_easy_setopt(curl, CURLOPT_DNS_CACHE_TIMEOUT, DNS_CACHE_TIMEOUT_S);
-        CURLcode rc = curl_easy_perform(curl);
-        long code = 0; curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
-        curl_slist_free_all(hdrs);
-        curl_mime_free(mime);
-        curl_easy_cleanup(curl);
-        return rc == CURLE_OK && code == 200;
     }
 
 private:
@@ -1436,10 +1322,6 @@ void playAlarm() {
 // /sys/class/gpio sysfs, so the previous export/value approach no longer
 // worked. gpioio::init() is shared with the button; on a dev box without
 // the chip it's a no-op and setLed just prints.
-constexpr int LED_R_BCM = 7;
-constexpr int LED_G_BCM = 1;
-constexpr int LED_B_BCM = 12;
-
 enum class LedColor { GREEN, RED, BLUE, OFF };
 
 void setLed(LedColor c) {
@@ -1566,80 +1448,15 @@ std::vector<float> recordCommand(AudioRing& ring, const std::atomic<bool>& runni
     std::cout<<"    Done ("<<audio.size()<<" samples).\n"; return audio;
 }
 
-std::vector<float> denoise(const std::vector<float>& audio) {
-    std::cout<<"🔇 Denoising...\n";
-    DenoiseState* st=rnnoise_create(nullptr);
-    std::vector<float> out(audio.size(),0.0f);
-    size_t i=0;
-    while (i+RNNOISE_FRAMES<=audio.size()) {
-        float frame[RNNOISE_FRAMES];
-        for (int j=0;j<RNNOISE_FRAMES;j++) frame[j]=audio[i+j]*32768.0f;
-        rnnoise_process_frame(st,frame,frame);
-        for (int j=0;j<RNNOISE_FRAMES;j++) out[i+j]=frame[j]/32768.0f;
-        i+=RNNOISE_FRAMES;
-    }
-    rnnoise_destroy(st); return out;
-}
-
-std::vector<float> applyVAD(const std::vector<float>& audio, SileroVAD& vad) {
-    std::cout<<"🔍 Applying VAD...\n"; vad.reset();
-
-    // Trim-only mode: find first and last speech windows, keep the contiguous
-    // span between them (with padding). Avoids chopping quiet phonemes /
-    // brief inter-syllable silences out of the middle of the utterance.
-    const int PAD_WINDOWS = 5;            // ~160 ms padding on each end
-
-    std::vector<float> probs;
-    for (size_t i=0; i+VAD_WINDOW<=audio.size(); i+=VAD_WINDOW) {
-        probs.push_back(vad.process(audio.data()+i, VAD_WINDOW));
-    }
-
-    int first = -1, last = -1;
-    for (int w=0; w<(int)probs.size(); w++) {
-        if (probs[w] >= VAD_THRESHOLD) {
-            if (first < 0) first = w;
-            last = w;
-        }
-    }
-
-    if (first < 0) {
-        std::cout<<"    No speech detected — using full audio.\n";
-        return audio;
-    }
-
-    first = std::max(0, first - PAD_WINDOWS);
-    last  = std::min((int)probs.size() - 1, last + PAD_WINDOWS);
-
-    size_t start_sample = (size_t)first * VAD_WINDOW;
-    size_t end_sample   = std::min(audio.size(), (size_t)(last + 1) * VAD_WINDOW);
-
-    int kept_ms = (int)((end_sample - start_sample) * 1000 / SAMPLE_RATE);
-    int total_ms = (int)(audio.size() * 1000 / SAMPLE_RATE);
-    std::cout<<"    Kept "<<kept_ms<<"/"<<total_ms<<" ms ("
-             <<(last-first+1)<<"/"<<probs.size()<<" windows).\n";
-
-    return std::vector<float>(audio.begin() + start_sample,
-                              audio.begin() + end_sample);
-}
-
 // (No local dispatcher — the server routes the audio. Pi is fire-and-forget
 //  past this point.)
 
 // =========================================================
-// FALL-STATE WATCHER — minimal stdin-driven toggle for testing.
-// =========================================================
-// CAMERA + FALL DETECTION pipeline (single thread)
+// CAMERA + FALL DETECTION
 //
-// One thread does both capture and processing. Capture pauses during
-// inference, but inference is ~20ms typical (1000ms inter-batch budget
-// at 16fps), so no frames are dropped in the normal path. Worst-case
-// (suspected-fall trigger with 16 MoVeNet calls) is ~1s of processing,
-// during which capture pauses — those frames are missed, but by then
-// we're confirming a fall anyway and the pain session is about to take
-// over, so the gap is harmless.
-//
-// Camera config matches all_together.py: 640x480 @ 16fps, BGR.
-// Python flips frames vertically (cv2.flip(frame, 0)) — we mirror.
+// The camera grabber thread fills a FrameBuffer (640x480 @ 16 fps, BGR).
+// fallPipelineThread takes batches of 16 frames from it and runs the fall
+// detector on each batch.
 // =========================================================
 constexpr int CAM_W            = 640;
 constexpr int CAM_H            = 480;
@@ -1667,13 +1484,9 @@ std::atomic<bool> g_mic_free{false};
 // stamp the fall event it sends after the session. -1 = not yet decided.
 std::atomic<int> g_fall_danger_level{-1};
 
-// ── Wi-Fi setup button (GPIO BCM 24 — match Python's `all_together.py`) ──
-// Polled inside fallPipelineThread (same loop, ~62 ms cadence is fine for
-// debounce). Held LOW = pressed (pull-up to 3V3). On a confirmed press we
-// shell out to wifi_setup.sh which brings up an AP and a tiny HTTP server;
-// see wifi_setup.sh + wifi_setup_server.py for the provisioning flow.
-constexpr int BUTTON_BCM_PIN   = 17;   // user-wired on Pi: BCM17 (physical pin 11)
-constexpr auto BUTTON_DEBOUNCE = std::chrono::milliseconds(50);
+// ── Physical button (GPIO BCM17, see gpio_io.cpp) ──
+// Polled by buttonThread. Held LOW = pressed (pull-up to 3V3). Presses feed the
+// state machine below, and a long hold starts setup mode (runWifiSetup).
 
 // On a laptop / dev machine where the GPIO pin doesn't exist, you can
 // simulate a button press by sending the process SIGUSR1:
@@ -1689,12 +1502,11 @@ extern "C" void on_sigusr1(int) { g_button_simulated.store(true); }
 static std::atomic<bool>* g_run_flag = nullptr;
 extern "C" void on_term(int) { if (g_run_flag) g_run_flag->store(false); }
 
-// Try to read the button via the sysfs GPIO interface (universally available
-// on Pi OS without extra packages). Returns true if pressed.
+// Read the button through libgpiod (gpio_io.cpp). Returns true if pressed.
 //
-// On a laptop the sysfs export will silently fail (no /sys/class/gpio); we
-// detect that on first call and switch to "signal-only" mode so the same
-// binary works on both platforms. Press behavior on laptop: send SIGUSR1.
+// On a laptop there is no GPIO chip; we detect that on first call and switch
+// to "signal-only" mode so the same binary works on both platforms. Press
+// behavior on laptop: send SIGUSR1.
 static bool readButton() {
     enum class Mode { UNKNOWN, GPIOD, SIGNAL_ONLY };
     static Mode mode = Mode::UNKNOWN;
@@ -1720,10 +1532,10 @@ static bool readButton() {
 }
 
 // ── Multi-mode button state machine ────────────────────────────────────────
-// Called every T5 tick (~30 ms). One physical button, mode-aware.
+// Called every buttonThread tick (~15 ms). One physical button, mode-aware.
 //
 // AWAKE (normal monitoring):
-//   3 rapid taps              → ENTER_GUEST (privacy/sleep — pause everything)
+//   3 rapid taps              → ENTER_GUEST (sleep mode — fall detection and camera pause, audio keeps running)
 //   5 rapid taps              → FACTORY_RESET
 //   hold 3-9.99 s             → ENTER_SETUP (BLE provisioning)
 //   hold ≥10 s                → REBOOT (a Pi has no soft power-on)
@@ -1938,7 +1750,7 @@ static void doReboot() {
 //   4. dev simulation (5 s wait) if nothing found
 //
 // LED stays BLUE while the sidecar is alive (see ButtonStateMachine which
-// sets it during the hold), then goes back to GREEN on success.
+// sets it during the hold), then returns to the idle colour on success.
 static bool runWifiSetup() {
     std::cout << "\n[setup] button-hold released — entering setup mode\n";
     setOled("none");                 // no eyes while unprovisioned / in setup
@@ -2008,22 +1820,6 @@ static std::vector<uint8_t> encodeJpeg(const cv::Mat& frame, int quality = 90) {
     return buf;
 }
 
-// Encode a rolling 5s buffer as MP4. cv::VideoWriter only writes to disk,
-// so we go via a temp path then read back. Mirrors Python's behavior.
-static std::vector<uint8_t> encodeMp4(const std::deque<cv::Mat>& frames) {
-    if (frames.empty()) return {};
-    const char* path = "/tmp/fall_event.mp4";
-    int fourcc = cv::VideoWriter::fourcc('m', 'p', '4', 'v');
-    cv::VideoWriter w(path, fourcc, CAM_FPS,
-                      cv::Size(frames.front().cols, frames.front().rows));
-    if (!w.isOpened()) return {};
-    for (const auto& f : frames) w.write(f);
-    w.release();
-    std::ifstream f(path, std::ios::binary);
-    return std::vector<uint8_t>((std::istreambuf_iterator<char>(f)),
-                                 std::istreambuf_iterator<char>());
-}
-
 // Mux the already-recorded continuous fall video file (pre-fall → fall →
 // feedback → response, written frame-by-frame to disk so RAM stays bounded) with
 // the matching continuous audio slice from the ring. Returns the muxed MP4 bytes
@@ -2060,10 +1856,15 @@ static std::vector<uint8_t> muxClipFile(const std::string& video_path,
 // fall loop would hang the entire device. Frames are stored already-flipped.
 struct FrameBuffer {
     std::mutex mtx;
-    cv::Mat    latest;                                   // most recent (flipped)
+    cv::Mat    latest;                                   // most recent (flipped), for snapshots
     std::chrono::steady_clock::time_point stamp{};       // when it was grabbed
     uint64_t   seq   = 0;                                 // ++ per new frame
     bool       valid = false;
+    // Every grabbed frame also goes into this bounded queue, which the fall thread drains in order, so a
+    // busy fall thread never loses frames (fall_cpp's own camera mode does the same). Oldest dropped when full.
+    static constexpr size_t kMaxQueued = 64;              // 4 batches at 16 fps
+    std::deque<cv::Mat> queue;
+    uint64_t   queue_overflow = 0;
 };
 
 // Open the capture device the way the old code did (index first, path fallback)
@@ -2154,6 +1955,8 @@ void cameraGrabberThread(std::atomic<bool>& running, FrameBuffer& fb) {
             fb.stamp = std::chrono::steady_clock::now();
             fb.seq++;
             fb.valid = true;
+            fb.queue.push_back(frame.clone());
+            if (fb.queue.size() > FrameBuffer::kMaxQueued) { fb.queue.pop_front(); ++fb.queue_overflow; }
         }
     }
     if (cap.isOpened()) cap.release();
@@ -2230,7 +2033,7 @@ void buttonThread(std::atomic<bool>& running) {
     std::cout << "[button] thread stopped\n";
 }
 
-// T5 — housekeeping: button + /Live_Device heartbeat (snapshot / pill alarms /
+// T5 — housekeeping: /Live_Device heartbeat (snapshot / pill alarms /
 // incoming-call / image-request). Split out of the fall thread so heavy
 // fall-inference bursts can never add latency to button response, pill
 // playback, or call pickup. Each cmd_client call uses its own curl handle, so
@@ -2407,20 +2210,22 @@ void housekeepingThread(std::atomic<bool>& running, std::shared_ptr<ServerComman
 
 void fallPipelineThread(std::atomic<bool>& running, std::shared_ptr<ServerCommandClient> cmd_client,
                         FrameBuffer& fb, AudioRing& ring) {
-    // cv::VideoCapture uses V4L2 backend; on Pi OS Bookworm V4L2 is wired
-    // to libcamera. Falls back to numeric device index if name open fails.
-    // CAMERA_DEV lets us point at a v4l2loopback device (e.g. /dev/video9)
-    // fed by rpicam-vid, instead of the raw CSI /dev/video0. The libcamera
-    // V4L2 compat layer (libcamerify) aborts on control enumeration with
-    // OpenCV, so on the Pi we feed frames through a loopback that presents
-    // as a plain UVC camera. Defaults to /dev/video0 for USB-cam/dev boxes.
-    // Camera frames now come from the grabber thread via `fb` — this thread
-    // never touches cv::VideoCapture, so a camera stall can't block the
-    // heartbeat or button below.
+    // Frames come from the camera grabber thread via `fb`. CAMERA_DEV is read there.
+#if USE_FALL_CPP
+    std::unique_ptr<fall_adapter::FallEngine> det;
+#else
     std::unique_ptr<fall::FallDetection> det;
+#endif
     try {
+#if USE_FALL_CPP
+        // Decision comes ~latency_batches() s after the fall (smoothing + cascade look-ahead).
+        const char* fall_cfg = std::getenv("FALL_CPP_CONFIG");
+        det = std::make_unique<fall_adapter::FallEngine>(fall_cfg ? fall_cfg : "fall_cpp/noban.yaml");
+        std::cout << "[fall] fall_cpp detector initialized.\n";
+#else
         det = std::make_unique<fall::FallDetection>(CAM_H, CAM_W);
         std::cout << "[fall] FallDetection initialized.\n";
+#endif
     } catch (const std::exception& e) {
         std::cerr << "[fall] init failed: " << e.what() << " — thread exiting.\n";
         return;
@@ -2432,7 +2237,7 @@ void fallPipelineThread(std::atomic<bool>& running, std::shared_ptr<ServerComman
     std::deque<cv::Mat> rolling;
     auto last     = std::chrono::steady_clock::now();
     cv::Mat frame;
-    uint64_t last_seq = 0;       // last frame seq we consumed from the buffer
+    uint64_t reported_overflow = 0;   // frame-queue overflows already logged
 
     // Fall A/V clip state. On a fall we open a VideoWriter and record the WHOLE
     // event continuously to disk (pre-roll frames first, then live frames right
@@ -2470,6 +2275,7 @@ void fallPipelineThread(std::atomic<bool>& running, std::shared_ptr<ServerComman
             was_in_call = false;
             if (det) det->insertGapSentinel();
             batch.clear(); batch.reserve(16);
+            { std::lock_guard<std::mutex> lk(fb.mtx); fb.queue.clear(); }   // frames from before the call are stale
         }
 
         // ── Pain session just ended → finalize the continuous clip and send the
@@ -2500,9 +2306,9 @@ void fallPipelineThread(std::atomic<bool>& running, std::shared_ptr<ServerComman
                              audio = std::move(audio)]() mutable {
                     auto clip = muxClipFile(vpath, audio);
                     auto jpeg = encodeJpeg(thumb);
-                    if (cmd_client) cmd_client->sendEventPacket(jpeg, clip, danger);
-                    std::cout << "[fall] event sent (danger=" << danger
-                              << ", clip " << clip.size() << "B)\n";
+                    const bool sent = cmd_client && cmd_client->sendEventPacket(jpeg, clip, danger);
+                    std::cout << (sent ? "[fall] event sent (danger=" : "[fall] event upload FAILED (danger=")
+                              << danger << ", clip " << clip.size() << "B)\n";
                     fall_upload_busy.store(false);
                 }).detach();
             } else {
@@ -2510,24 +2316,22 @@ void fallPipelineThread(std::atomic<bool>& running, std::shared_ptr<ServerComman
             }
         }
 
-        // ── Fetch the latest frame from the grabber. Never blocks. If there's
-        // no FRESH frame (feeder hiccup, or camera released during a call) we
-        // skip fall processing this iteration — but the heartbeat/button above
-        // already ran, so the device stays responsive regardless of the camera.
+        // ── Take the next queued frame from the grabber, in order. Never blocks. If the queue is empty
+        // (feeder hiccup, or camera released during a call) we skip fall processing this iteration — but the
+        // heartbeat/button run in their own threads, so the device stays responsive regardless of the camera.
         cv::Mat fbuf;
-        uint64_t seq = 0;
-        std::chrono::steady_clock::time_point stamp{};
         {
             std::lock_guard<std::mutex> lk(fb.mtx);
-            if (fb.valid) { fb.latest.copyTo(fbuf); seq = fb.seq; stamp = fb.stamp; }
+            if (!fb.queue.empty()) { fbuf = std::move(fb.queue.front()); fb.queue.pop_front(); }
+            if (fb.queue_overflow != reported_overflow) {
+                std::cerr << "[fall] camera queue overflow, dropped " << (fb.queue_overflow - reported_overflow) << " frames\n";
+                reported_overflow = fb.queue_overflow;
+            }
         }
-        bool fresh = !fbuf.empty() && seq != last_seq &&
-                     (now - stamp) < std::chrono::milliseconds(700);
-        if (!fresh) {
+        if (fbuf.empty()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
             continue;
         }
-        last_seq = seq;
         frame = fbuf;
         double dt = std::chrono::duration<double>(now - last).count();
         last = now;
@@ -2775,11 +2579,9 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Phase 5.1 — open the persistent MQTT subscription. Broker URI defaults
-    // to the same host as SERVER_BASE_URL on port 1883, override via
-    // MQTT_HOST + MQTT_PORT env. Coexists with the HTTP /Live_Device poll
-    // for now (safety net); once MQTT delivery is verified, polling can drop
-    // to a low-frequency liveness ping.
+    // Open the persistent MQTT connection. The broker host and port come from
+    // the MQTT_HOST and MQTT_PORT env vars (set by the systemd unit). The
+    // 192.168.1.104:1883 default is for a dev box only.
     auto _mqtt_broker_uri = [] () {
         const char* host = std::getenv("MQTT_HOST");
         const char* port = std::getenv("MQTT_PORT");
@@ -2794,11 +2596,12 @@ int main(int argc, char** argv) {
     // Fall-video test:  --fall-video <path.mp4> [--fall-loops N]
     //   loops the video N times to exceed the 7-batch threshold (Stage 6
     //   needs batch_number >= 7 to fire the MLP confirm). Default N = 3.
-    std::string parity_dir, fall_video, wuw_wav;
+    std::string parity_dir, fall_video, fall_offline, wuw_wav;
     int fall_loops = 3;
     for (int i = 1; i < argc - 1; ++i) {
         if (std::string(argv[i]) == "--parity-fixtures") parity_dir = argv[i + 1];
         if (std::string(argv[i]) == "--fall-video")     fall_video = argv[i + 1];
+        if (std::string(argv[i]) == "--fall-offline")   fall_offline = argv[i + 1];
         if (std::string(argv[i]) == "--fall-loops")     fall_loops = std::atoi(argv[i + 1]);
         if (std::string(argv[i]) == "--wuw-wav")        wuw_wav    = argv[i + 1];
     }
@@ -2815,7 +2618,6 @@ int main(int argc, char** argv) {
     // every stride so their PCEN state stays warm and continuous.
     WakeWordDetector hey_wwd;  if (!hey_wwd.init(HEY_MODEL)) return 1;
     hey_wwd.warmUp();
-    SileroVAD vad;         vad.init(SILERO_MODEL);
     auto cmd_client = std::make_shared<ServerCommandClient>();
     // Honor the SERVER_URL env (set by systemd) for ALL server comms — heartbeat,
     // snapshots, events, calls. Previously hardcoded SERVER_BASE_URL, so the device
@@ -2831,6 +2633,36 @@ int main(int argc, char** argv) {
     if (!parity_dir.empty()) {
         return runParityFixtures(parity_dir, wwd, pain_pipe);
     }
+#if USE_FALL_CPP
+    if (!fall_offline.empty()) {
+        // Offline check of the live detector path: the same FallEngine the camera loop uses, fed the frames of a
+        // video file batch by batch with no real-time pacing, so it can be compared with fall_cpp's own "infer" mode.
+        cv::VideoCapture cap(fall_offline);
+        if (!cap.isOpened()) { std::cerr << "could not open " << fall_offline << "\n"; return 1; }
+        const char* cfg_env = std::getenv("FALL_CPP_CONFIG");
+        fall_adapter::FallEngine engine(cfg_env ? cfg_env : "fall_cpp/noban.yaml");
+        const int B = engine.batch_size();
+        const int flush_batches = engine.latency_batches() + 2;     // quiet tail so the last decisions can arrive
+        std::vector<fall::FrameClass> batch;
+        int batch_idx = 0, events = 0;
+        auto push = [&](const cv::Mat& f) {
+            batch.push_back({f.clone(), 16.0});
+            if (static_cast<int>(batch.size()) < B) return;
+            engine.frame_inference(std::move(batch));
+            batch.clear();
+            ++batch_idx;
+            if (engine.drain().fall_label) { ++events; std::cout << "FALL decided in batch " << batch_idx << "\n"; }
+        };
+        long n_frames = 0;
+        cv::Mat last;
+        for (cv::Mat f; cap.read(f) && !f.empty();) { push(f); last = f.clone(); ++n_frames; }   // streamed, a long video is not held in RAM
+        cap.release();
+        for (int i = 0; i < flush_batches * B && !last.empty(); ++i) push(last);
+        std::cout << "offline " << fall_offline << ": " << n_frames << " frames, " << batch_idx << " batches, "
+                  << events << " fall events\n";
+        return 0;
+    }
+#endif
     if (!fall_video.empty()) {
         // Per-batch parity dump against /tmp/fall_python.json.
         cv::VideoCapture cap(fall_video);
@@ -2904,7 +2736,9 @@ int main(int argc, char** argv) {
     //     releases the device for calls/pain. Sole ALSA capture opener.
     //   • T2 camera grabber — owns cv::VideoCapture, fills the frame buffer.
     //   • T3 this main() thread — WUW + pain state machine; CONSUMES the ring.
-    //   • T4 fall+heartbeat — fall detection + /Live_Device (pills/calls/button).
+    //   • T4 fall — fallPipelineThread, fall detection on the camera frames.
+    //   • T5 housekeeping — /Live_Device heartbeat, pills, calls.
+    //   • T6 button — buttonThread, polls the GPIO button.
     std::atomic<bool> fallRunning(true);
     g_run_flag = &fallRunning;
     std::signal(SIGTERM, on_term);
@@ -2942,7 +2776,7 @@ int main(int argc, char** argv) {
     bool  schmitt_armed=true;
 
     // ── "Hey" pre-gate state (guest-mode double-gate). In guest mode the "Hey"
-    // EMA opens a window; the FULL strict-EMA "Noban" must then fire within
+    // EMA opens a window; "Noban" must then fire within
     // HEY_GATE_WINDOW_MS for the wake to count. BOTH models gate on their EMA.
     float ema_hey=0.0f, ema_hey_other=0.0f, ema_hey_noise=0.0f;
     bool  hey_gate_open=false;
@@ -3022,10 +2856,9 @@ int main(int argc, char** argv) {
                        : (res == pain::SessionResult::FINE) ? 0 : 1;
             g_fall_danger_level.store(danger);
 
-            // Auto-clear g_fall now that pain session finished. The fall
-            // detector's internal `ignore=5` counter prevents immediate
-            // re-fire for the next ~5 batches (~5s @ 16fps/16-batch), giving
-            // the person time to recover before WUW would be paused again.
+            // Auto-clear g_fall now that the pain session finished. The fall
+            // detector suppresses an immediate re-fire on its own, giving the
+            // person time to recover before WUW would be paused again.
             pain::g_fall.store(0);
             if (!fallRunning.load()) break;
 
@@ -3063,7 +2896,7 @@ int main(int argc, char** argv) {
         float margin = ema_wake - std::max(ema_other, ema_noise);
 
         // ── "Hey" pre-gate inference (runs every stride to stay warm). EMAs are
-        // kept for diagnostics, but the gate opens on a RAW per-frame "Hey".
+        // and the gate opens when the "Hey" EMA is above HEY_EMA_UP and dominant.
         auto hp = hey_wwd.inferFromFeatures(hey_wwd.computeFeatures(chunk));
         ema_hey       = ALPHA*hp.wake  + (1.0f-ALPHA)*ema_hey;
         ema_hey_other = ALPHA*hp.other + (1.0f-ALPHA)*ema_hey_other;
@@ -3117,7 +2950,7 @@ int main(int argc, char** argv) {
             // within it. The Hey gate supplies the precision, so the gated Noban
             // uses a slightly LOWER EMA bar (GUEST_NOBAN_UP) — still EMA + margin +
             // Schmitt + cooldown, just enough that a deliberate "Hey … Noban"
-            // (which lands ema_wake ~0.56-0.65, right on the strict 0.60) fires
+            // (which lands ema_wake ~0.56-0.65, close to the normal fire threshold) fires
             // reliably instead of half the time.
             bool noban_gated = (cooldown == 0) && schmitt_armed && (post_resume_settle == 0)
                             && (ema_wake > GUEST_NOBAN_UP) && (margin > MARGIN_MIN);
@@ -3131,7 +2964,7 @@ int main(int argc, char** argv) {
             can_fire = hey_gate_open && (noban_gated || noban_raw);
             if (can_fire) hey_gate_open = false;   // consume on success
         } else {
-            can_fire = noban_fired;   // normal mode: single strict-EMA Noban (0.60)
+            can_fire = noban_fired;   // normal mode: single EMA "Noban" above THRESHOLD_UP
         }
         if (can_fire) {
             schmitt_armed = false;

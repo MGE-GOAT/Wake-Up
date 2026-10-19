@@ -1,0 +1,166 @@
+# ======================================================================================
+# Fall-detection framework - default configuration.
+# Run:  python run.py --config configs/default.yaml --mode <mode> [--set a.b=value ...]
+# Values marked (EXPERIMENTAL) were not tuned on data; calibrate them on the val split.
+# ======================================================================================
+mode: train_cnn          # prepare_dataset | export_models | gt_bboxes | eval_bbox | extract_features
+                     # train_svm | train_cnn | infer | annotate | stream
+
+paths:               # relative paths are resolved against the project root
+  data_root: ../1_raw_data
+  models_dir: models
+  workspace: workspace
+
+runtime:
+  use_gpu: false         # true on the Linux GPU server (needs onnxruntime-gpu / CUDA torch)
+  gpu_device_id: 0
+  num_threads: 0         # 0 = ONNX Runtime default
+  log_level: INFO
+
+temporal:
+  target_fps: 16         # canonical rate for datasets AND camera streams
+  batch_size: 16         # module input; must equal window_size
+  window_size: 16
+  fallback_fps: 25.0     # used only if a file reports an invalid fps
+
+input:
+  max_side: 960          # frames are downscaled (aspect kept) so the longer side <= this; null = off
+
+dataset:
+  video_exts: [".avi", ".mp4", ".mov", ".mkv", ".m4v", ".webm"]
+  videos_dir_names: ["videos"]       # matched case-insensitively
+  annotation_file: Annotation_files_new.txt
+  annotation_frame_base: 0           # 0 or 1: are annotated frame numbers 0- or 1-based? (check visually)
+  on_count_mismatch: error           # error | prefix (prefix is only safe for partial copies of the data)
+  label_overrides: configs/label_overrides.yaml
+  include_groups: ["*"] #"*"
+  exclude_groups: []
+
+split:
+  seed: 42
+  fixed:                              # groups matching these patterns are pinned to a split
+    test: ["ur_*"]
+  families:                           # regex -> family; a family is assigned to ONE split as a unit
+    "le2i_coffee_room_\\d+": le2i_coffee_room
+    "le2i_home_\\d+": le2i_home
+  dataset_pattern: "^([A-Za-z0-9]+)_"  # regex whose group 1 names the source dataset (le2i, multicam, ur)
+  ratios: {train: 0.70, val: 0.15, test: 0.15}   # applied per source dataset to the non-pinned families
+
+models:
+  strict_signature: true             # refuse models trained with a different feature definition
+
+# ---------------------------------------------------------------- person box sub-module
+bbox:
+  yolo:
+    enabled: true
+    model: yolo11n.onnx
+    input_size: 320
+    every_n_frames: 8                # t; must divide batch_size. Raise on slow hardware.
+    conf: 0.2
+    iou_nms: 0.5
+    full_frame_every_n_runs: 8       # when no ROI exists, search the full frame every n-th run
+  background: {grid: 16, update_margin: 0.02}
+  coarse: {width: 80, threshold: 45, kernel: 7, close_iterations: 2, min_area_ratio: 0.0005,
+           max_area_ratio: 0.5, diff_step: 4}
+  fine: {size: 70, threshold: 40, temporal_threshold: 35, kernel: 5, close_iterations: 3,
+         min_area_ratio: 0.0005, pad_ratio: 0.01}
+  roi: {margin_with_yolo: 1.4, margin_without_yolo: 2.0, min_side_frac: 0.33}
+  fusion: {weight_yolo: 1.0, weight_bg: 0.25, weight_interp: 0.25, bg_score: 0.3,
+           bg_gate_iou: 0.1, max_gap_frames: 12}
+  smoothing: {half_window: 6, sigma: 3.0}     # look-ahead = half_window + max_gap_frames
+  multi_person: {conf: 0.4, confirm_runs: 3, suspend_batches: 3}
+
+# ---------------------------------------------------------------- shared feature definitions
+representation:
+  point_order: legacy        # legacy (old notebook) | chain (skeleton-adjacent rows; hypothesis to ablate)
+  channels: 3                # 2 = (x, y) after confidence-aware smoothing; 3 = (x, y, confidence)
+  batch_bbox_margin: 1.2
+  pose_smoothing: {half_window: 3, sigma: 2.0}
+
+pose:
+  model: RTMPose-t.onnx
+  input_size: [192, 256]     # (w, h) of the model input
+  bbox_padding: 1.25
+  simcc_split_ratio: 2.0
+  rgb_input: true
+
+# ---------------------------------------------------------------- cascade
+classic:
+  svm_model: svm.onnx
+  svm_threshold: 0.4
+  use_model_threshold: true  # use the threshold stored next to the trained model if present
+  high_sensitive: {suppress_vr_below: 0.001, suppress_vc_below: -0.001,
+                   force_vc_above: 0.02, force_vr_above: 0.01}
+  post1: {min_count: 4}      # window sum of SVM flags needed to keep a frame (old: w0 = 4)
+  post2: {min_count: 3}      # window sum needed to mark a frame suspicious (old code: > 2)
+
+deep:
+  cnn_model: cnn.onnx
+  cnn_threshold: 0.94
+  use_model_threshold: false
+  window_stride: 1           # CNN window stride inside suspicious runs
+  cooldown_batches: 6
+  min_mean_confidence: 0.4   # (EXPERIMENTAL) pose-quality gate; RTMPose scores differ from MoveNet
+  min_frame_confidence: 0.085
+
+# ---------------------------------------------------------------- evaluation
+outputs:
+  render_videos: true     # annotated videos in workspace/*/videos (GT label + predictions)
+
+evaluation:
+  splits: [train, val, test]
+  event_tolerance_s: {before: 1.0, after: 3.0}   # event_time in [gt_start - before, gt_end + after] is a hit
+  bbox_ap_iou: [0.5, 0.95]
+
+gt_bboxes:
+  model: yolo11x.onnx
+  input_size: 640
+  conf: 0.30
+  batch_size: 8
+  use_original_resolution: true
+  splits: [train, val, test]
+
+# ---------------------------------------------------------------- feature extraction / training
+features:
+  splits: [train, val, test]
+  overwrite: false
+  stride_negative: 6
+  stride_positive: 1
+  cnn_label: {policy: coverage, min_coverage: 0.9}   # coverage | strict
+  svm_label: {policy: coverage, min_coverage: 0.8}
+  min_valid_boxes: 16
+
+train:
+  svm:
+    kernel: rbf
+    C: 1.0
+    gamma: scale
+    class_weight_positive: 15
+    max_negative_samples: 40000
+    standardize: true
+    refit_on_train_val: true
+    threshold_beta: 2.0      # threshold maximising F-beta on val (favour recall: SVM is a filter)
+    target_opset: 15
+  cnn:
+    arch: vgg2d              # vgg2d (old notebook) | tcn1d
+    width: 16
+    dropout: 0.2
+    batch_norm: true
+    epochs: 60
+    batch_size: 64
+    lr: 0.0005
+    weight_decay: 0.0
+    patience: 15
+    augment_hflip: true
+    noise_std: 0.005
+    seed: 1
+    threshold_beta: 2.0      # threshold maximising F-beta on val (beta>1 favours recall)
+    onnx_opset: 17
+
+stream:
+  source: 0
+  trust_camera_rate: true    # camera already delivers target_fps
+  headless: false
+
+export:
+  yolo_variants: ["yolo11x", "yolo11s"]

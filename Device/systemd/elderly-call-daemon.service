@@ -4,10 +4,6 @@ After=elderly-pipeline.service
 
 [Service]
 Environment=XDG_RUNTIME_DIR=/run/user/1000
-Environment=AEC_MODE=off
-Environment=AEC_DELAY_MS=200
-Environment=GATE_THRESHOLD=200
-Environment=GATE_HANGOVER=0.8
 User=pi
 Group=pi
 Environment=HOME=/home/pi

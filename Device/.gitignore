@@ -22,3 +22,6 @@ id.txt
 # raw model staging (provenance only)
 new_models/
 *.predoublegate
+
+# ── Tool caches (claude-flow hooks) ──────────────────────────────────────────
+.claude-flow/
