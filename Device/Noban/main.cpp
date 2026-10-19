@@ -1129,10 +1129,11 @@ struct ServerCommandClient {
     // ── POST a fall event (thumbnail + A/V clip) to /Message_Device. The
     //    danger level comes from the pain feedback (0=fine/green, 1=unclear/
     //    orange, 2=pain/red) and drives the notification + app card colour.
+    //    `when` is the time of the fall (0 = now), so a retried upload keeps its original time.
     bool sendEventPacket(const std::vector<uint8_t>& jpeg,
                          const std::vector<uint8_t>& mp4,
-                         int danger_level) {
-        return postMessageDevice("Event", -1, jpeg, mp4, danger_level);
+                         int danger_level, std::time_t when = 0) {
+        return postMessageDevice("Event", -1, jpeg, mp4, danger_level, when);
     }
 
 private:
@@ -1142,7 +1143,7 @@ private:
                            int image_req_id,
                            const std::vector<uint8_t>& jpeg,
                            const std::vector<uint8_t>& mp4,
-                           int danger_level = 2) {
+                           int danger_level = 2, std::time_t when = 0) {
         std::string url = base_url + MSG_ENDPOINT;
         std::string response;
         CURL* curl = curl_easy_init();
@@ -1153,7 +1154,7 @@ private:
         // For "Event" type, Python uses "Event Title" + "Danger Level" — we
         // include both to match the app's existing parser.
         char tbuf[64];
-        std::time_t now = std::time(nullptr);
+        std::time_t now = when ? when : std::time(nullptr);
         struct tm tmv;  // localtime_r — std::localtime's static buffer races T4/T5
         std::strftime(tbuf, sizeof(tbuf), "%Y-%m-%d %H:%M:%S", localtime_r(&now, &tmv));
         // ── Phase 3.1 E2E media crypto ──────────────────────────────────
@@ -1344,6 +1345,23 @@ void setLed(LedColor c) {
 // g_guest_mode is declared earlier.
 LedColor idleColor() { return g_guest_mode.load() ? LedColor::RED : LedColor::BLUE; }
 LedColor recColor()  { return LedColor::GREEN; }
+
+// The CSI camera is switched on and off through its feeder service (elderly-camera streams the sensor into
+// /dev/video9). Sleep mode stops it, so the sensor is really off and not just ignored, and wake or a call
+// starts it again. The systemctl call returns at once (--no-block). A restart of the pipeline starts the feeder
+// again through the unit's Wants=, so a crash can never leave the device in the dark.
+static std::atomic<bool> g_camera_feeder_on{true};
+static void setCameraFeeder(bool on) {
+    if (g_camera_feeder_on.exchange(on) == on) return;
+    std::system(on ? "sudo -n systemctl start --no-block elderly-camera"
+                   : "sudo -n systemctl stop --no-block elderly-camera");
+    std::cout << "[camera] feeder " << (on ? "started" : "stopped") << "\n";
+}
+// Blocks until /dev/video9 carries a stream again (the sensor needs a few seconds), capped.
+static void waitForCameraStream() {
+    std::system("timeout 12 sh -c 'until v4l2-ctl -d /dev/video9 --get-fmt-video 2>/dev/null"
+                " | grep -Eq \"Size Image *: *[1-9]\"; do sleep 0.5; done'");
+}
 
 // ── OLED interactive "eyes" ────────────────────────────────────────────────
 // The eyes are drawn by a separate persistent daemon (oled_eyes.py) that polls
@@ -2020,10 +2038,12 @@ void buttonThread(std::atomic<bool>& running) {
             case ButtonGesture::FACTORY_RESET: doFactoryReset(); break;
             case ButtonGesture::ENTER_GUEST:
                 g_guest_mode.store(true);  setLed(LedColor::RED); setOled("sleep");
+                setCameraFeeder(false);
                 std::cout << "[guest] SLEEP — fall+camera paused; wake is double-gated (\"Hey\"+\"Noban\"); press once to wake\n";
                 break;
             case ButtonGesture::WAKE:
                 g_guest_mode.store(false); setLed(idleColor()); setOled("wakegreet");
+                setCameraFeeder(true);
                 std::cout << "[guest] WAKE — monitoring resumed\n";
                 break;
             case ButtonGesture::NONE: break;
@@ -2059,9 +2079,11 @@ void housekeepingThread(std::atomic<bool>& running, std::shared_ptr<ServerComman
             // below so a SLEEP command silences this same cycle.
             if (st.guest_cmd == 1 && !g_guest_mode.load()) {
                 g_guest_mode.store(true);  setLed(LedColor::RED); setOled("sleep");
+                setCameraFeeder(false);
                 std::cout << "[guest] SLEEP via app — fall+camera paused; wake double-gated (\"Hey\"+\"Noban\")\n";
             } else if (st.guest_cmd == 0 && g_guest_mode.load()) {
                 g_guest_mode.store(false); setLed(idleColor()); setOled("wakegreet");
+                setCameraFeeder(true);
                 std::cout << "[guest] WAKE via app — monitoring resumed\n";
             }
             if (st.image_req_id >= 0 && !g_guest_mode.load()) {  // no snapshots while asleep (privacy)
@@ -2174,6 +2196,10 @@ void housekeepingThread(std::atomic<bool>& running, std::shared_ptr<ServerComman
                 for (int i = 0; i < 20 && !g_mic_free.load(); ++i)
                     std::this_thread::sleep_for(std::chrono::milliseconds(50));
                 std::this_thread::sleep_for(std::chrono::milliseconds(150)); // camera release
+                if (g_guest_mode.load()) {   // a call in sleep mode still needs video, for its duration only
+                    setCameraFeeder(true);
+                    waitForCameraStream();
+                }
                 setLed(LedColor::GREEN);   // GREEN for the duration of a call
                 std::string cmd =
                     std::string("DEVICE_ID='") + DEVICE_ID + "' " +
@@ -2187,6 +2213,7 @@ void housekeepingThread(std::atomic<bool>& running, std::shared_ptr<ServerComman
                 int rc = std::system(cmd.c_str());
                 std::cout << "[call] helper exited rc=" << rc << "\n";
                 setLed(idleColor());
+                if (g_guest_mode.load()) setCameraFeeder(false);   // still asleep after the call
                 g_in_call.store(false);   // T4 sees this → inserts the camera gap
                 // Authoritatively clear the server call state now that OUR helper
                 // has exited — otherwise a stalled/crashed app that never sent
@@ -2206,6 +2233,50 @@ void housekeepingThread(std::atomic<bool>& running, std::shared_ptr<ServerComman
         std::this_thread::sleep_for(std::chrono::milliseconds(30));
     }
     std::cout << "[housekeeping] thread stopped\n";
+}
+
+// A fall event the server did not accept (server or network down at that moment). It is kept in memory and
+// retried in the background, so a fall that happens during an outage still reaches the caregiver once the
+// connection is back. Only the newest kMaxPending events are kept and an event is dropped after kMaxAge.
+struct PendingEvent {
+    std::vector<uint8_t> jpeg, clip;
+    int danger = 2;
+    std::time_t when = 0;
+};
+
+static void queueEventRetry(std::shared_ptr<ServerCommandClient> cmd_client, PendingEvent ev) {
+    static constexpr size_t kMaxPending = 3;
+    static constexpr std::time_t kMaxAge = 6 * 3600;
+    static constexpr int kRetryPeriodS = 30;
+    static std::mutex mu;
+    static std::deque<PendingEvent> pending;
+    static bool worker_running = false;
+
+    std::lock_guard<std::mutex> lk(mu);
+    pending.push_back(std::move(ev));
+    while (pending.size() > kMaxPending) pending.pop_front();
+    if (worker_running) return;
+    worker_running = true;
+    std::thread([cmd_client] {
+        for (;;) {
+            std::this_thread::sleep_for(std::chrono::seconds(kRetryPeriodS));
+            PendingEvent e;
+            {
+                std::lock_guard<std::mutex> lk2(mu);
+                while (!pending.empty() && std::time(nullptr) - pending.front().when > kMaxAge) {
+                    std::cout << "[fall] dropping an event older than " << kMaxAge / 3600 << " h that could not be sent\n";
+                    pending.pop_front();
+                }
+                if (pending.empty()) { worker_running = false; return; }
+                e = pending.front();
+            }
+            if (cmd_client && cmd_client->sendEventPacket(e.jpeg, e.clip, e.danger, e.when)) {
+                std::cout << "[fall] retried event sent (danger=" << e.danger << ")\n";
+                std::lock_guard<std::mutex> lk2(mu);
+                if (!pending.empty() && pending.front().when == e.when) pending.pop_front();
+            }
+        }
+    }).detach();
 }
 
 void fallPipelineThread(std::atomic<bool>& running, std::shared_ptr<ServerCommandClient> cmd_client,
@@ -2302,13 +2373,15 @@ void fallPipelineThread(std::atomic<bool>& running, std::shared_ptr<ServerComman
             static std::atomic<bool> fall_upload_busy(false);
             bool _fall_exp = false;
             if (fall_upload_busy.compare_exchange_strong(_fall_exp, true)) {
-                std::thread([cmd_client, danger, vpath, thumb,
+                const std::time_t fall_time = std::time(nullptr);
+                std::thread([cmd_client, danger, vpath, thumb, fall_time,
                              audio = std::move(audio)]() mutable {
                     auto clip = muxClipFile(vpath, audio);
                     auto jpeg = encodeJpeg(thumb);
-                    const bool sent = cmd_client && cmd_client->sendEventPacket(jpeg, clip, danger);
-                    std::cout << (sent ? "[fall] event sent (danger=" : "[fall] event upload FAILED (danger=")
+                    const bool sent = cmd_client && cmd_client->sendEventPacket(jpeg, clip, danger, fall_time);
+                    std::cout << (sent ? "[fall] event sent (danger=" : "[fall] event upload FAILED, will retry (danger=")
                               << danger << ", clip " << clip.size() << "B)\n";
+                    if (!sent) queueEventRetry(cmd_client, PendingEvent{std::move(jpeg), std::move(clip), danger, fall_time});
                     fall_upload_busy.store(false);
                 }).detach();
             } else {
