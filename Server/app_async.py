@@ -194,7 +194,7 @@ def _now_str() -> str:
 def _is_recent(ts, max_age_s: int) -> bool:
     """True if timestamp `ts` (text or datetime, naive local time like _now_str)
     is within max_age_s of now. Used to derive device online/offline from
-    devices.last_seen (device heartbeats ~every 30s)."""
+    devices.last_seen (device heartbeats ~every 100ms)."""
     if not ts:
         return False
     if isinstance(ts, datetime):
@@ -614,6 +614,16 @@ def _autoclear_stale_call(box):
 
 
 # ── notification fan-out (async) ────────────────────────────────────────────
+_push_tasks: set = set()   # keeps background push tasks alive until they finish
+
+
+async def _send_push(username, token, title, body, color):
+    try:
+        await run_in_threadpool(send_notification, token, title, body, color)
+    except Exception as e:
+        print(f"  FCM send to {username} failed: {e}")
+
+
 async def fanout_message(device_id, msg_id, fcm_title, fcm_body, fcm_color):
     subs = await pool.fetch(
         "SELECT username FROM subscriptions WHERE device_id = $1", device_id)
@@ -625,11 +635,13 @@ async def fanout_message(device_id, msg_id, fcm_title, fcm_body, fcm_color):
         urow = await pool.fetchrow(
             "SELECT firebase_token FROM users WHERE username = $1", username)
         if urow and urow["firebase_token"]:
-            try:
-                await run_in_threadpool(send_notification, urow["firebase_token"],
-                                        fcm_title, fcm_body, fcm_color)
-            except Exception as e:
-                print(f"  FCM send to {username} failed: {e}")
+            # The push goes out in the background. When Google is slow or unreachable the send can take
+            # longer than the device waits for its reply, so awaiting it here made voice commands time out
+            # on the device even though the server had already carried them out.
+            task = asyncio.create_task(_send_push(username, urow["firebase_token"],
+                                                  fcm_title, fcm_body, fcm_color))
+            _push_tasks.add(task)
+            task.add_done_callback(_push_tasks.discard)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1356,9 +1368,9 @@ async def pill_status_app(request: Request):
         "SELECT call_requested, guest FROM active_devices WHERE device_id=$1", device_id)
     call_req = row["call_requested"] if row else None
     guest = bool(row["guest"]) if row else False
-    # online = device heartbeated recently. It polls /Live_Device ~every 30s, so
-    # 90s (~3 missed beats) is the offline threshold the app uses to show the
-    # "device disconnected" banner; it clears automatically when beats resume.
+    # online = device heartbeated recently. It polls /Live_Device ~every 100ms, so
+    # 90s is a lenient offline threshold (tolerates brief network drops) the app
+    # uses to show the "device disconnected" banner; it clears when beats resume.
     last_seen = await pool.fetchval(
         "SELECT last_seen FROM devices WHERE device_id=$1", device_id)
     online = _is_recent(last_seen, 90)

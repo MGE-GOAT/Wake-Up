@@ -119,7 +119,7 @@ models/
 Redis, mosquitto and Janus should already be enabled as services. PostgreSQL on
 this box is the named cluster `postgresql@18-main`:
 ```bash
-sudo systemctl start postgresql@18-main
+echo mg18138044 | sudo -S systemctl start postgresql@18-main
 sudo systemctl start redis-server      # or: redis
 sudo systemctl start mosquitto
 sudo systemctl start janus
