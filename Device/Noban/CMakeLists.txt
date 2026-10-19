@@ -70,6 +70,13 @@ if(USE_FALL_CPP)
         ${FALL_CPP_DIR}/src/person_box_module.cpp ${FALL_CPP_DIR}/src/background.cpp
         ${FALL_CPP_DIR}/src/yolo_ncnn.cpp ${FALL_CPP_DIR}/src/onnx_models.cpp
         ${FALL_CPP_DIR}/src/video_source.cpp)
+    # The rest of the device is built with -ffast-math. fall_cpp must not be: its box and background code relies on
+    # exact floating point (its own CMakeLists says so), and with fast-math it finds a person in an empty scene
+    # and runs the pose model on every batch. The adapter is included here because it compiles fall_cpp headers.
+    get_target_property(FALL_CPP_TARGET_SOURCES pipeline SOURCES)
+    list(FILTER FALL_CPP_TARGET_SOURCES INCLUDE REGEX "(fall_adapter|fall_cpp/src/)")
+    set_source_files_properties(${FALL_CPP_TARGET_SOURCES} PROPERTIES
+        COMPILE_OPTIONS "-fno-fast-math;-fno-finite-math-only;-fno-unsafe-math-optimizations")
     target_include_directories(pipeline PRIVATE ${FALL_CPP_DIR}/src "${NCNN_DIR}/include")
     target_compile_definitions(pipeline PRIVATE USE_FALL_CPP=1)
     target_link_libraries(pipeline PRIVATE ncnn OpenMP::OpenMP_CXX)
